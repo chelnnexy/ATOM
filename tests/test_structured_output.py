@@ -221,7 +221,12 @@ def test_empty_batch_does_not_touch_gpu_metadata_or_logits(controller):
 @pytest.mark.parametrize("required", [False, True])
 def test_native_tools_are_an_alternative_to_schema_text(controller, required):
     spec = json.dumps(
-        {"prefix": "", "section": "calls", "names": ["weather"], "required": required}
+        {
+            "prefix": "",
+            "section": "calls",
+            "tools": [{"name": "weather", "parameters": None}],
+            "required": required,
+        }
     )
     compiled = controller.compile('{"const":{"answer":42}}', spec)
     examples = [
@@ -244,7 +249,12 @@ def test_native_tools_are_an_alternative_to_schema_text(controller, required):
 def test_tool_format_is_part_of_incremental_state_identity(controller):
     b = batch(schema={"const": {"answer": 42}})
     fmt = json.dumps(
-        {"prefix": "", "section": "calls", "names": ["weather"], "required": False}
+        {
+            "prefix": "",
+            "section": "calls",
+            "tools": [{"name": "weather", "parameters": None}],
+            "required": False,
+        }
     )
     schema, marker, history = b.structured_requests[0]
     b.structured_requests[0] = ((schema, fmt), marker, history)
@@ -407,3 +417,93 @@ def test_gpu_metadata_requires_prefetch(controller):
     md = NS(input_ids=torch.zeros(3, device="cuda"))
     with pytest.raises(ValueError, match="not prefetched"):
         controller.apply(torch.zeros(1, 128, device="cuda"), batch(), md)
+
+
+WEATHER = {
+    "type": "object",
+    "properties": {
+        "city": {"type": "string", "description": "free text"},
+        "unit": {"enum": ["c", "f"]},
+        "days": {"type": "integer", "minimum": 1, "maximum": 7},
+        "where": {"$ref": "#/$defs/point"},
+    },
+    "required": ["city", "unit", "days", "where"],
+    "additionalProperties": False,
+    "$defs": {
+        "point": {
+            "type": "object",
+            "properties": {"lat": {"type": "number"}},
+            "required": ["lat"],
+            "additionalProperties": False,
+        }
+    },
+}
+
+
+def strict_call(city="Paris", unit="c", days="3", where='{"lat": 1.5}', order=None):
+    params = {
+        "city": f'<parameter name="city" string="true">{city}</parameter>',
+        "unit": f'<parameter name="unit" string="true">{unit}</parameter>',
+        "days": f'<parameter name="days" string="false">{days}</parameter>',
+        "where": f'<parameter name="where" string="false">{where}</parameter>',
+    }
+    body = "\n".join(params[k] for k in order or params)
+    return f'<calls>\n<invoke name="weather">\n{body}\n</invoke>\n</calls>'
+
+
+def accepts(controller, compiled, text):
+    matcher = xgr.GrammarMatcher(compiled)
+    return all(matcher.accept_token(t) for t in [*text.encode(), 127])
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        (strict_call(), True),
+        # Raw strings are exact: whatever the value, nothing is padded.
+        (strict_call(city=" Paris, FR "), True),
+        (strict_call(unit="k"), False),
+        (strict_call(days="9"), False),
+        (strict_call(days='"3"'), False),
+        (strict_call(where='{"lat": "north"}'), False),
+        (strict_call(where='{"lat": 1, "lon": 2}'), False),
+        (strict_call(order=["unit", "city", "days", "where"]), False),
+        (strict_call(order=["city", "unit", "days"]), False),
+        (strict_call().replace('"city" string="true"', '"city" string="false"'), False),
+        # Free text may precede the calls, but cannot open a call of its own.
+        ("Checking.\n\n" + strict_call(), True),
+        ("plain answer", True),
+        ('<invoke name="weather"></invoke>', False),
+    ],
+)
+def test_strict_tool_arguments_follow_the_parameters_schema(controller, text, expected):
+    spec = json.dumps(
+        {
+            "prefix": "",
+            "section": "calls",
+            "tools": [{"name": "weather", "parameters": WEATHER}],
+            "required": False,
+        }
+    )
+    assert accepts(controller, controller.compile(None, spec), text) == expected
+
+
+def test_strict_and_free_tools_share_one_reply(controller):
+    spec = json.dumps(
+        {
+            "prefix": "",
+            "section": "calls",
+            "tools": [
+                {"name": "weather", "parameters": WEATHER},
+                {"name": "search", "parameters": None},
+            ],
+            "required": True,
+        }
+    )
+    compiled = controller.compile(None, spec)
+    free = '<invoke name="search"><parameter name="q">anything</parameter></invoke>'
+    assert accepts(
+        controller, compiled, strict_call().replace("</calls>", free + "</calls>")
+    )
+    assert not accepts(controller, compiled, "plain answer")
+    assert not accepts(controller, compiled, strict_call(unit="k"))

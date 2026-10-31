@@ -235,6 +235,7 @@ class ScheduledBatch:
             )
             for i, seq in enumerate(seqs.values())
             if getattr(seq, "json_schema", None) is not None
+            or getattr(seq, "structured_tool_format", None)
         }
         # `context_lens` is set further down, once `num_cached_tokens` is known:
         # a chunked prefill's context ends at this chunk, not at the whole

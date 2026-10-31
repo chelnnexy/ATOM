@@ -16,6 +16,7 @@ multi-backend interfaces.
 | `__init__.py` | Lightweight entry points used by the API preflight and model runner. |
 | `manager.py` | Worker admission, cached compilation, committed and speculative grammar state, and prepare/apply/commit ordering. |
 | `backend_guidance.py` | llguidance compiler and matcher adapter. |
+| `dsml_grammar.py` | DSML tool-call grammar for beta strict function tools. |
 | `schema_normalization.py` | Exact constraint lowering and shared expansion budgets. |
 | `mask.py` | Reusable packed mask buffers, H2D transfer and kernel dispatch. |
 | `transfer.py` | Owned token snapshots, pinned host buffers and asynchronous D2H events. |
@@ -119,8 +120,8 @@ With a DSML parser, normal function tools can accompany Chat `response_format`
 or Responses `text.format`. The grammar admits the parser's canonical function
 envelope or a schema-conforming answer. Required/named choices select the tool
 branch; `tool_choice="none"` selects JSON text. Function-only turns have no
-response text to validate; subsequent text answers remain constrained. This is
-not beta strict-tool argument validation. Other tool parser formats, P/D handoff,
+response text to validate; subsequent text answers remain constrained. Other
+tool parser formats, P/D handoff,
 multimodal input, custom stop strings, and `ignore_eos` remain unsupported with
 constraints. Synthetic forced acceptance is also rejected. No image
 implementation is included.
@@ -162,6 +163,26 @@ perform host grammar work. There is no zero-overhead claim. Performance results
 must distinguish enabled-request overhead from disabled-request regression and
 compare matching generated outputs. Production and broader-topology qualification
 remain separate tasks.
+
+## Strict function tools (beta)
+
+On `/beta/chat/completions`, a function with `"strict": true` has its
+arguments constrained by its `parameters` schema, with or without
+`response_format`. Following DeepSeek's contract, every object must list all of
+its properties in `required` and set `additionalProperties: false`;
+`minLength`, `maxLength`, `minItems` and `maxItems` are rejected, as are
+schemas the grammar backend cannot compile, all with HTTP 400 before enqueue.
+
+The grammar is the DSML envelope itself (`dsml_grammar.py`): parameters appear
+once each, in declared order. An unconstrained `type: "string"` is a raw
+`string="true"` value and a string `enum`/`const` its raw alternatives; every
+other schema, including patterned and formatted strings, is a `string="false"`
+JSON value under its own JSON grammar, with the root `$defs` available to it.
+Free text may precede the calls but cannot contain the DSML prefix, so no call
+escapes the grammar. Non-strict functions in the same request keep a free
+body. Parsed arguments are validated again, formats included, before success
+is reported. `/v1/chat/completions` keeps ignoring `strict`; the thinking-mode
+refusal of required/named `tool_choice` still applies.
 
 ## Model discovery
 

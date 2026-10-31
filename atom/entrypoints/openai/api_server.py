@@ -1777,10 +1777,11 @@ async def _configure_structured_output(
     *,
     tools=None,
     tool_choice=None,
+    strict_schemas=None,
     kv_transfer=None,
     multimodal=False,
 ):
-    if schema is None:
+    if schema is None and not strict_schemas:
         return
     if kv_transfer or multimodal:
         raise ValueError("Structured output currently requires text without P/D")
@@ -1801,7 +1802,9 @@ async def _configure_structured_output(
     from atom.structured_output.worker_preflight import WorkerGrammarPreflight
 
     marker = structured_reasoning_marker(channel, tokenizer)
-    tool_format = structured_tool_format(tool_call_parser_cls, tools, tool_choice)
+    tool_format = structured_tool_format(
+        tool_call_parser_cls, tools, tool_choice, strict_schemas
+    )
     preflight = getattr(_configure_structured_output, "preflight", None)
     try:
         if (
@@ -1891,14 +1894,24 @@ async def _chat_completions(
             ),
         )
 
-        from atom.structured_output.request_validation import schema_from_format
+        from atom.structured_output.request_validation import (
+            schema_from_format,
+            strict_tool_schemas,
+        )
 
         schema = schema_from_format(request.response_format)
-        if schema is not None and assistant_prefix is not None:
+        # Strict function tools are a beta feature; /v1 keeps ignoring `strict`.
+        strict_schemas = (
+            strict_tool_schemas(request.tools)
+            if beta and request.tool_choice != "none"
+            else {}
+        )
+        if assistant_prefix is not None and (schema is not None or strict_schemas):
             # The grammar constrains the reply from its first token, and a
             # prefix has already written part of it.
             raise ValueError(
-                "an assistant prefix cannot be combined with structured output"
+                "an assistant prefix cannot be combined with structured output "
+                "or strict tools"
             )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -1972,6 +1985,7 @@ async def _chat_completions(
             _reasoning,
             tools=request.tools,
             tool_choice=request.tool_choice,
+            strict_schemas=strict_schemas,
             kv_transfer=request.kv_transfer_params,
             multimodal=_has_multimodal_content(messages),
         )
@@ -2036,12 +2050,12 @@ async def _chat_completions(
                         (request.stream_options or {}).get("include_usage")
                     ),
                 )
-            if schema is not None:
+            if schema is not None or strict_schemas:
                 from atom.structured_output.response_validation import (
                     validate_chat_stream,
                 )
 
-                gen = validate_chat_stream(gen, schema)
+                gen = validate_chat_stream(gen, schema, strict_schemas)
             return StreamingResponse(
                 _client_stream(gen, request_id),
                 media_type="text/event-stream",
@@ -2147,8 +2161,11 @@ async def _chat_completions(
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
             )
-        if schema is not None:
-            from atom.structured_output.response_validation import validate_output
+        if schema is not None or strict_schemas:
+            from atom.structured_output.response_validation import (
+                validate_output,
+                validate_tool_calls,
+            )
 
             for choice in resp.choices:
                 validate_output(
@@ -2156,6 +2173,11 @@ async def _chat_completions(
                     choice["message"].get("content") or "",
                     choice.get("finish_reason"),
                     tool_calls=bool(choice["message"].get("tool_calls")),
+                )
+                validate_tool_calls(
+                    strict_schemas,
+                    choice["message"].get("tool_calls"),
+                    choice.get("finish_reason"),
                 )
         _log_request_model("response", request_id, resp)
         # Bypass FastAPI's recursive conversion of the token ID list.
