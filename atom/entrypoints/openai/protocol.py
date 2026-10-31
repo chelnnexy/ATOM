@@ -307,6 +307,9 @@ class CompletionRequest(BaseModel):
     # pre-tokenized path (see get_prompt_or_tokens). The nested
     # array-of-token-arrays (batch) form is not supported.
     prompt: str | list[int] | None = None
+    # Text after the gap a fill-in-the-middle request asks the model to fill;
+    # served by /beta/completions only.
+    suffix: str | None = None
     temperature: float | None = DEFAULT_TEMPERATURE
     top_k: int | None = DEFAULT_TOP_K
     top_p: float | None = DEFAULT_TOP_P

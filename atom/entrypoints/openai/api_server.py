@@ -77,7 +77,9 @@ from .chat_encoders import (
     render_probe_prompt,
     resolve_reasoning_toggle,
 )
+from .fim import FimFormat, resolve_fim_format
 from .metrics_setup import create_metrics_exporter
+from .prefix_completion import continue_prompt, take_assistant_prefix
 from .protocol import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
@@ -204,6 +206,9 @@ processor: Any | None = None
 model_name: str = ""
 default_chat_template_kwargs: dict[str, Any] = {}
 custom_message_encoder: Any | None = None
+# The model's fill-in-the-middle markers, found in its vocabulary at startup;
+# None when it has none and /beta/completions cannot honour a `suffix`.
+fim_format: FimFormat | None = None
 _seq_id_to_request_id: dict[int, str] = {}
 _stream_loops: dict[str, AbstractEventLoop] = {}
 _request_start_times: dict[str, float] = {}
@@ -1660,18 +1665,24 @@ app.add_middleware(TraceMiddleware, model=lambda: model_name)
 
 # ---- Error handlers ----
 
+# Generation routes whose errors use the OpenAI envelope.
+_OPENAI_ERROR_ROUTES = frozenset(
+    {
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/responses",
+        "/beta/chat/completions",
+        "/beta/completions",
+    }
+)
+
 
 @app.exception_handler(RequestValidationError)
 async def request_validation_error_handler(
     request: Request, exc: RequestValidationError
 ):
     path = request.url.path
-    if path not in {
-        "/v1/chat/completions",
-        "/v1/completions",
-        "/v1/responses",
-        "/v1/messages",
-    }:
+    if path not in _OPENAI_ERROR_ROUTES and path != "/v1/messages":
         return await request_validation_exception_handler(request, exc)
     # Do not serialize exc.body, input values or arbitrary Pydantic ctx objects.
     message = "; ".join(
@@ -1691,11 +1702,7 @@ async def request_validation_error_handler(
 async def openai_http_error_handler(request: Request, exc: HTTPException):
     # HTTPException bypasses the ValueError/Exception handlers. Keep its status
     # and headers, but use the same OpenAI error envelope on generation routes.
-    if request.url.path not in {
-        "/v1/chat/completions",
-        "/v1/completions",
-        "/v1/responses",
-    }:
+    if request.url.path not in _OPENAI_ERROR_ROUTES:
         return await http_exception_handler(request, exc)
     return JSONResponse(
         status_code=exc.status_code,
@@ -1817,14 +1824,29 @@ async def _configure_structured_output(
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
+    return await _chat_completions(request, raw_request, beta=False)
 
+
+@app.post("/beta/chat/completions")
+async def beta_chat_completions(request: ChatCompletionRequest, raw_request: Request):
+    """Chat completions plus DeepSeek's beta assistant-prefix completion."""
+    return await _chat_completions(request, raw_request, beta=True)
+
+
+async def _chat_completions(
+    request: ChatCompletionRequest, raw_request: Request, *, beta: bool
+):
     validate_model(request.model)
     _validate_chunked_receive(request.kv_transfer_params)
 
     try:
         request.tools = normalize_chat_tools(request.tools)
         validate_chat_request(request)
-        messages = request.get_messages()
+        messages, assistant_prefix = take_assistant_prefix(request.get_messages())
+        if assistant_prefix is not None and not beta:
+            raise ValueError(
+                "assistant prefix completion is served by /beta/chat/completions"
+            )
 
         merged_kwargs = dict(default_chat_template_kwargs)
         if request.chat_template_kwargs:
@@ -1872,6 +1894,12 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         from atom.structured_output.request_validation import schema_from_format
 
         schema = schema_from_format(request.response_format)
+        if schema is not None and assistant_prefix is not None:
+            # The grammar constrains the reply from its first token, and a
+            # prefix has already written part of it.
+            raise ValueError(
+                "an assistant prefix cannot be combined with structured output"
+            )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         set_request_id(request_id)
@@ -1887,6 +1915,13 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         is_multimodal = _has_multimodal_content(messages)
         multimodal_data = None
         kv_transfer_params = request.kv_transfer_params
+        if assistant_prefix is not None and (
+            is_multimodal or request.get_prompt_token_ids() is not None
+        ):
+            raise ValueError(
+                "an assistant prefix cannot be combined with image input or "
+                "prompt_token_ids"
+            )
         if is_multimodal:
             # Media loading (blocking network I/O, up to a 30s urlopen) plus
             # processor preprocessing are heavy and would stall the event loop;
@@ -1925,6 +1960,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             ),
             template_kwargs=merged_kwargs,
         )
+        if assistant_prefix is not None:
+            prompt_or_tokens, continues_reasoning = continue_prompt(
+                prompt_or_tokens, assistant_prefix
+            )
+            _reasoning = replace(_reasoning, starts_open=continues_reasoning)
 
         await _configure_structured_output(
             sampling_params,
@@ -2135,7 +2175,27 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
 @app.post("/v1/completions")
 async def completions(request: CompletionRequest, raw_request: Request):
     """Handle text completion requests (OpenAI-compatible)."""
+    return await _completions(request, raw_request, beta=False)
 
+
+@app.post("/beta/completions")
+async def beta_completions(request: CompletionRequest, raw_request: Request):
+    """Text completions plus DeepSeek's beta fill-in-the-middle (``suffix``)."""
+    return await _completions(request, raw_request, beta=True)
+
+
+def _fill_in_the_middle_prompt(request: CompletionRequest, *, beta: bool) -> str:
+    """Render a ``suffix`` request's prompt in the model's FIM format."""
+    if not beta:
+        raise ValueError("'suffix' (fill-in-the-middle) is served by /beta/completions")
+    if fim_format is None:
+        raise ValueError("this model has no fill-in-the-middle format")
+    if not isinstance(request.prompt, str) or request.get_prompt_token_ids():
+        raise ValueError("fill-in-the-middle needs 'prompt' as text, not token IDs")
+    return fim_format.render(request.prompt, request.suffix)
+
+
+async def _completions(request: CompletionRequest, raw_request: Request, *, beta: bool):
     validate_model(request.model)
     _validate_chunked_receive(request.kv_transfer_params)
 
@@ -2156,7 +2216,10 @@ async def completions(request: CompletionRequest, raw_request: Request):
             n=effective_n,
         )
         # Prefer pre-tokenized IDs; otherwise pass text to preprocessing.
-        prompt_or_tokens = request.get_prompt_or_tokens()
+        if request.suffix is not None:
+            prompt_or_tokens = _fill_in_the_middle_prompt(request, beta=beta)
+        else:
+            prompt_or_tokens = request.get_prompt_or_tokens()
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
@@ -3244,7 +3307,7 @@ def main():
     global tool_call_parser_cls, required_tool_channel
     global model_starts_in_reasoning, reasoning_toggle
     global reasoning_dialect, synthetic_token_text
-    global custom_message_encoder, _stream_batch_dispatcher
+    global custom_message_encoder, _stream_batch_dispatcher, fim_format
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -3326,6 +3389,7 @@ def main():
 
     logger.info(f"Loading tokenizer from {args.model}...")
     tokenizer = _load_tokenizer(args.model, args.trust_remote_code)
+    fim_format = resolve_fim_format(tokenizer)
     if args.chat_template:
         if os.path.isfile(args.chat_template):
             with open(args.chat_template, "r", encoding="utf-8") as f:
