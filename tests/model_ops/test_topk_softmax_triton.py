@@ -318,9 +318,13 @@ def test_triton_router_ties_and_padding_rows_match_aiter(dtype):
 
 @gpu
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("tokens", [4, 40])
+@pytest.mark.parametrize("tokens", [4, 40, 200, 1000])
 def test_fused_shared_topk_reads_padded_stride_logits(topk_mod, tokens, dtype):
-    """A [M, 513] view of a 528-wide router output routes like contiguous logits."""
+    """A [M, 513] view of a 528-wide router output routes like contiguous logits,
+    on the Triton router (decode, <= 128 rows) and on AITER (prefill, above)."""
+    from atom.model_ops.triton_topk_softmax import use_triton_topk_softmax
+
+    assert use_triton_topk_softmax(True, tokens, 1, "sigmoid") == (tokens <= 128)
     padded = torch.randn(tokens, 528, device="cuda").to(dtype)
     view = padded[:, : N_ROUTED + 1]
 
