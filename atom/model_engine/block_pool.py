@@ -3,10 +3,10 @@
 
 import array
 from collections import OrderedDict
-from collections.abc import Callable, Hashable, Iterable
+from collections.abc import Callable, Hashable, Iterable, Iterator
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
-from itertools import islice
+from itertools import chain, islice
 
 from atom.model_engine.kv_block import Block
 
@@ -189,11 +189,16 @@ class BlockPool:
         of a whole chain with `map`. Read it per walk, not once per pool."""
         return self._hash_to_block_id.get
 
-    def count_used(self, block_ids: list[int], n: int) -> int:
+    def count_used(
+        self, block_ids: list[int], n: int, also: set[int] | None = None
+    ) -> int:
         """How many of the first `n` of `block_ids` (distinct) some live
-        sequence holds. No slice; the set it builds holds only the used ids,
-        and a waiting head's hit blocks are mostly free."""
-        return len(self._used.intersection(islice(block_ids, n)))
+        sequence holds, or `also` names. No slice; the set it builds holds only
+        the used ids, and a waiting head's hit blocks are mostly free."""
+        used = self._used.intersection(islice(block_ids, n))
+        if not also:
+            return len(used)
+        return len(used) + len(also.intersection(islice(block_ids, n)) - used)
 
     def claim_many(self, block_ids) -> None:
         """`claim` each of `block_ids`, in order, with the lookups hoisted."""
@@ -275,6 +280,14 @@ class BlockPool:
         block.hash = -1
         block.token_ids = array.array("i")
         return dropped
+
+    def eviction_order(self) -> Iterator[int]:
+        """The free blocks still holding content, in the order `_take_free`
+        spends them once the vacant ones are gone. Read-only; a lazy iterator,
+        valid while the pool does not change."""
+        for block_id in chain(self._cached, self._protected):
+            if block_id in self._free and self.blocks[block_id].hash != -1:
+                yield block_id
 
     # ---------------------------- allocation ------------------------------- #
     def _take_free(self) -> int:

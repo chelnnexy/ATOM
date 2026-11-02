@@ -4,7 +4,7 @@
 import array
 import logging
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from itertools import islice
 from math import inf, isinf
@@ -136,6 +136,36 @@ class AdmissionProbe:
     num_cached_blocks: int = -1
     block_hashes: list[int] = field(default_factory=list)
     num_new_blocks: int | None = None
+
+
+@dataclass(slots=True)
+class PoolReservation:
+    """What a dry admission pass has already given the seqs it admitted, as
+    `allocate` would take it from the pool one seq after another.
+
+    `blocks` are pool units (each admitted seq's `num_new_blocks`), and
+    `block_ids` the cached hit blocks among them: a later seq hitting one of
+    those finds it held, as it would after the earlier seq's `allocate`, so a
+    shared free prefix is counted once. `state_slots` are per-request state
+    slots.
+
+    `evicted` are the cached free blocks the admitted seqs' fresh blocks
+    would take once the vacant ones are gone (`BlockPool._take_free`'s order):
+    a later seq's hit ends before the first of them, as its walk would after
+    the earlier `allocate`. Not simulated: PAGE checkpoint images that
+    `ensure_free_units` would evict, and the hit image a restore pins.
+
+    Filled by `BlockManager.reserve`; read by `can_allocate_memoized`.
+    """
+
+    blocks: int = 0
+    block_ids: set[int] = field(default_factory=set)
+    state_slots: int = 0
+    evicted: set[int] = field(default_factory=set)
+    # Fresh blocks taken so far, and where the next one past the vacant ones
+    # comes from (an iterator over the free list's cached half, LRU first).
+    fresh: int = 0
+    evict_cursor: Iterator[int] | None = None
 
 
 # Evicted or remapped hashes kept for `_CachedWalk` revalidation; a memo
@@ -1208,16 +1238,12 @@ class BlockManager:
         record: bool,
         block_hashes: list[int] | None,
         probe: AdmissionProbe | None = None,
-        *,
-        reserved_blocks: int = 0,
-        reserved_state_slots: int = 0,
-        demand: list[int] | None = None,
-        observe: bool = True,
+        reserved: PoolReservation | None = None,
     ) -> int:
         """`can_allocate` over the walk `walk_of(seq)` returns; everything but
         the walk is asked afresh on every call. `probe.num_new_blocks` is set
-        once the fit passes. The reserved / demand / observe arguments serve
-        `can_allocate_memoized`'s multi-seq probe."""
+        once the fit passes. The fit is asked of the pool left after
+        `reserved`, if given."""
         # Active Slots are preallocated; PAGE checkpoints share the KV pool.
         #
         # The full per-request width, because that is what `allocate` will take:
@@ -1225,8 +1251,10 @@ class BlockManager:
         # rollback set to.
         if block_hashes is not None:
             block_hashes.clear()
+        reserved_blocks = reserved.blocks if reserved is not None else 0
         if seq.has_per_req_cache and not self.state.has_free(
-            self.state_slots_per_req + reserved_state_slots
+            self.state_slots_per_req
+            + (reserved.state_slots if reserved is not None else 0)
         ):
             return -1
         if not self.enable_prefix_caching:
@@ -1235,13 +1263,15 @@ class BlockManager:
             ) + self.draft_lookahead_blocks(len(seq))
             if not self._has_page_units(num_new_blocks + reserved_blocks):
                 return -1
-            if demand is not None:
-                demand.append(num_new_blocks)
+            if probe is not None:
+                probe.num_new_blocks = num_new_blocks
             return 0
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
         # read the WHOLE history, so this stays a full front-to-back chained
         # match). Record each block's hash for the SWA scan below.
         walk = walk_of(seq)
+        if reserved is not None and reserved.evicted:
+            walk = self._walk_after_evictions(walk, reserved.evicted)
         if block_hashes is None:
             block_hashes = walk.hashes  # read, never extended, below
         else:
@@ -1267,15 +1297,18 @@ class BlockManager:
         # Instrumentation: the pre-gate hit, so EngineStats can separate reuse
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
-        if observe:
-            seq.num_compressed_hit_blocks = compressed_hit
+        seq.num_compressed_hit_blocks = compressed_hit
         # Free-pool demand: blocks we actually reuse minus those already used
         # (shared ref); blocks we drop from the hit become fresh → counted.
         # Plus the draft round's lookahead past the prompt, which the scheduler
         # allocates right after `allocate` (`may_append(..., lookahead=)`).
         num_new_blocks = (
             self._n_hash_blocks(seq)
-            - self.kv.count_used(walk.ids, num_cached_blocks)
+            - self.kv.count_used(
+                walk.ids,
+                num_cached_blocks,
+                also=reserved.block_ids if reserved is not None else None,
+            )
             + self.draft_lookahead_blocks(len(seq))
         )
         protected_hash = (
@@ -1287,20 +1320,17 @@ class BlockManager:
         #
         # `resumable`, not the replayed hit: the counterfactual is asked of the
         # gates, whose answer a replay does not change.
-        if observe:
-            self._record_checkpoint_demand(
-                seq,
-                hit=resumable,
-                compressed_hit=compressed_hit,
-                block_hashes=block_hashes,
-                live_blocks=num_new_blocks,
-                protected_hash=protected_hash,
-            )
-            self._record_checkpoint_end(seq)
+        self._record_checkpoint_demand(
+            seq,
+            hit=resumable,
+            compressed_hit=compressed_hit,
+            block_hashes=block_hashes,
+            live_blocks=num_new_blocks,
+            protected_hash=protected_hash,
+        )
+        self._record_checkpoint_end(seq)
         if not self._has_page_units(num_new_blocks + reserved_blocks, protected_hash):
             return -1
-        if demand is not None:
-            demand.append(num_new_blocks)
         # `record_allocation` re-checks a joint against this demand instead of
         # walking the hit again.
         if probe is not None:
@@ -1489,11 +1519,8 @@ class BlockManager:
     def can_allocate_memoized(
         self,
         seq: Sequence,
-        *,
-        reserved_blocks: int = 0,
-        reserved_state_slots: int = 0,
-        demand: list[int] | None = None,
-        observe: bool = True,
+        probe: AdmissionProbe | None = None,
+        reserved: PoolReservation | None = None,
     ) -> int:
         """`can_allocate(seq, record=False)` for the delayer and the DP chunk
         cost, with the walk memoised per seq. The same `_evaluate`, so state
@@ -1507,24 +1534,79 @@ class BlockManager:
         `clear_cache`, the first miss still resolves the same (a hit only grows
         by a publish of that hash), and token count and seed are unchanged.
 
-        A probe that walks several waiting seqs asks each one's fit against the
-        pool its predecessors would leave: `reserved_blocks` / `reserved_state_slots`
-        are what the seqs it already counted take, and `demand` (if given)
-        receives this seq's own pool blocks so the caller can add them up.
-        `observe=False` leaves the seq's hit instrumentation and checkpoint
-        demand/end untouched: a fill probe is not an admission.
+        An optional `probe` receives the hit and the fit's demand
+        (`num_new_blocks`), but not the chain: a memoised answer is never
+        committed (`record_allocation`). `reserved`: the fit is asked of the
+        pool left after it (`PoolReservation`).
         """
         walk_of = self._memoised_walk if self.walk_memo else self._walk_prefix
-        return self._evaluate(
-            seq,
-            walk_of,
-            False,
-            None,
-            reserved_blocks=reserved_blocks,
-            reserved_state_slots=reserved_state_slots,
-            demand=demand,
-            observe=observe,
+        if probe is None:
+            return self._evaluate(seq, walk_of, False, None, reserved=reserved)
+        probe.num_new_blocks = None
+        probe.num_cached_blocks = self._evaluate(
+            seq, walk_of, False, None, probe, reserved
         )
+        return probe.num_cached_blocks
+
+    def reserve(
+        self, reserved: PoolReservation, seq: Sequence, probe: AdmissionProbe
+    ) -> None:
+        """Add what `allocate(seq, probe.num_cached_blocks)` takes to
+        `reserved`: the fit's demand, the state slots and the hit blocks it
+        claims. `probe` is a passed `can_allocate_memoized` answer."""
+        assert probe.num_new_blocks is not None, "reserve a seq that fits"
+        reserved.blocks += probe.num_new_blocks
+        if seq.has_per_req_cache:
+            reserved.state_slots += self.state_slots_per_req
+        claimed = 0
+        if self.enable_prefix_caching and probe.num_cached_blocks > 0:
+            walk_of = self._memoised_walk if self.walk_memo else self._walk_prefix
+            walk = walk_of(seq)
+            if reserved.evicted:
+                walk = self._walk_after_evictions(walk, reserved.evicted)
+            hit_ids = set(islice(walk.ids, probe.num_cached_blocks))
+            # The free ones leave the free list as named blocks, not pops.
+            claimed = sum(
+                1
+                for block_id in hit_ids - reserved.block_ids
+                if not self.kv.is_used(block_id)
+            )
+            reserved.block_ids |= hit_ids
+        self._reserve_fresh(reserved, probe.num_new_blocks - claimed)
+
+    def _reserve_fresh(self, reserved: PoolReservation, count: int) -> None:
+        """Take `count` fresh blocks in `reserved`, as `BlockPool._take_free`
+        would: vacant ones first, then cached free ones, least recently freed
+        first, which `reserved.evicted` records."""
+        kv = self.kv
+        vacant = kv.num_free - kv.num_reusable_free
+        spill = reserved.fresh + count - max(vacant, reserved.fresh)
+        reserved.fresh += count
+        if spill <= 0:
+            return
+        if reserved.evict_cursor is None:
+            reserved.evict_cursor = kv.eviction_order()
+        for block_id in reserved.evict_cursor:
+            if block_id in reserved.block_ids:
+                continue
+            reserved.evicted.add(block_id)
+            spill -= 1
+            if spill == 0:
+                return
+
+    @staticmethod
+    def _walk_after_evictions(walk: _PrefixWalk, evicted: set[int]) -> _PrefixWalk:
+        """`walk` ended before its first block in `evicted`."""
+        for i, block_id in enumerate(walk.ids):
+            if block_id in evicted:
+                return _PrefixWalk(
+                    walk.num_tokens,
+                    walk.cache_seed,
+                    walk.index_version,
+                    walk.hashes[:i],
+                    walk.ids[:i],
+                )
+        return walk
 
     def _memoised_walk(self, seq: Sequence) -> _PrefixWalk:
         memo = self._cached_walks.get(seq)

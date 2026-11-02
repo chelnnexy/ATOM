@@ -28,6 +28,7 @@ import threading
 import time
 from collections import Counter, deque
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -38,6 +39,7 @@ from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import (
     AdmissionProbe,
     BlockManager,
+    PoolReservation,
     draft_kv_lookahead,
 )
 from atom.model_engine.dynamic_chunking import (
@@ -88,6 +90,69 @@ class ChunkKind(enum.Enum):
     NEXT = enum.auto()
     # A prefill that must go whole (`_requires_atomic_prefill`): never limited.
     WHOLE = enum.auto()
+
+
+class _Verdict(enum.Enum):
+    """What Phase 2 does with one waiting seq (`Scheduler._decide_waiting_seq`)."""
+
+    # Allocate it and prefill it.
+    ADMIT = enum.auto()
+    # An offload resume: it holds its blocks since before its load; prefill it.
+    RESUME = enum.auto()
+    # Pass over it this pass (`prefix_waiters`): its tier lookup is in flight,
+    # or it waits for a hybrid producer's prompt-end checkpoint.
+    WAIT = enum.auto()
+    # Put it back at the head of `waiting` and end the pass.
+    STOP = enum.auto()
+    # Dry pass only: the answer needs a connector call a dry pass may not make.
+    # The pass ends there, and the rank counts as prefillable.
+    UNKNOWN = enum.auto()
+
+
+@dataclass(slots=True)
+class _WaitingSeqDecision:
+    """`_decide_waiting_seq`'s answer. For ADMIT / RESUME: the forward starts
+    at `start` (a replayed hit starts below `resume`, where the seq resumes)
+    and takes `chunk` rows, sized before `allocate` and the commit's
+    adjusters; ADMIT also carries the fit (`hbm_probe`) and the connector's
+    answers that the commit acts on."""
+
+    verdict: _Verdict
+    start: int = 0
+    resume: int = 0
+    chunk: int = 0
+    num_new_tokens: int = 0
+    budget_remaining: int = 0
+    atomic: bool = False
+    replayed: bool = False
+    hbm_probe: AdmissionProbe | None = None
+    lookup_detachable: bool = False
+    needs_remote_load: bool = False
+
+
+@dataclass(slots=True)
+class _DryAdmission:
+    """A dry Phase 2 pass so far: the pool its admitted seqs take, and those
+    seqs with the row their forward starts at, so a later seq can wait on one
+    as a producer (`_wait_for_inflight_prefix`), as it would once admission
+    has put the earlier one in `running`."""
+
+    reserved: PoolReservation = field(default_factory=PoolReservation)
+    admitted: list[tuple[Sequence, int]] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class _DryPass:
+    """The prefill a dry pass predicts for this tick: `(start, rows)` per seq,
+    in batch order. `prefillable` also holds when the pass stopped at a seq it
+    could not decide (`_Verdict.UNKNOWN`)."""
+
+    prefillable: bool = False
+    chunks: list[tuple[int, int]] = field(default_factory=list)
+
+    @property
+    def num_tokens(self) -> int:
+        return sum(rows for _, rows in self.chunks)
 
 
 # How often the stalled-save reconciler actually scans deferred_free_blocks. The
@@ -916,12 +981,15 @@ class Scheduler:
         self._inflight_prefix_wait = {}
 
     def _wait_for_inflight_prefix(
-        self, seq: Sequence, cached_tokens: int, *, peek: bool = False
+        self,
+        seq: Sequence,
+        cached_tokens: int,
+        dry: _DryAdmission | None = None,
     ) -> bool:
         """Bounded wait for a hybrid producer's planned prompt-end checkpoint.
 
-        `peek=True` answers without starting the wait's deadline: the fill
-        probe asks what admission would do, it does not decide it.
+        A dry pass (`dry`) also asks of the seqs it admitted before `seq`, and
+        does not start the wait's deadline.
         """
         bm = self.block_manager
         delayer = self.prefill_delayer
@@ -936,11 +1004,17 @@ class Scheduler:
         deadline = self._inflight_prefix_wait.get(seq.id)
         if deadline is not None and self._schedule_tick >= deadline:
             return False
-        for producer in self.running:
+        producers = (
+            (producer, producer.num_cached_tokens)
+            for producer in self.running
+            if producer.status == SequenceStatus.RUNNING
+        )
+        if dry is not None:
+            producers = itertools.chain(producers, dry.admitted)
+        for producer, produced in producers:
             anchor = producer.checkpoint_end_pos
             if (
-                producer.status != SequenceStatus.RUNNING
-                or producer.num_cached_tokens >= anchor
+                produced >= anchor
                 or anchor - cached_tokens < self.max_num_batched_tokens
                 or anchor >= seq.num_prompt_tokens
                 or producer.multimodal_data is not None
@@ -969,7 +1043,7 @@ class Scheduler:
                 np.frombuffer(seq.token_ids, dtype=np.int32, count=anchor),
                 np.frombuffer(producer.token_ids, dtype=np.int32, count=anchor),
             ):
-                if not peek:
+                if dry is None:
                     self._inflight_prefix_wait.setdefault(
                         seq.id, self._schedule_tick + delayer.ttft_max_ticks
                     )
@@ -985,21 +1059,40 @@ class Scheduler:
             ):
                 yield seq
 
-    def _local_prefill_pending_work(self) -> tuple[bool, int]:
-        """Count probed work; a bounded scan never invents fill for unseen work."""
-        # The probe sizes the chunks admission is about to size; only
-        # admission's outcomes belong in the sizing report.
+    def _local_prefill_pending_work(
+        self, dry_pass: _DryPass | None = None
+    ) -> tuple[bool, int]:
+        """The delayer's fill probe: whether this rank would prefill now, and
+        how many rows, capped at the budget (`_dry_admission_pass`)."""
+        if dry_pass is None:
+            dry_pass = self._dry_admission_pass()
+        return dry_pass.prefillable, min(
+            dry_pass.num_tokens, self.max_num_batched_tokens
+        )
+
+    def _dry_admission_pass(self) -> _DryPass:
+        """The prefill Phase 1 and Phase 2 would schedule if released now,
+        without scheduling it. Phase 2's per-seq decision is admission's own
+        (`_decide_waiting_seq`), asked of the pool the seqs admitted before it
+        leave (`PoolReservation`). Chunk sizing's calibration arm and counts
+        are restored: only admission's outcomes belong in them."""
         counts = self._dynamic_chunking_counts.copy()
+        arm = (self._calibration_small_arm, self._calibration_arm_drawn)
         try:
-            return self._probe_local_prefill_work()
+            return self._run_dry_admission_pass()
         finally:
             self._dynamic_chunking_counts = counts
+            self._calibration_small_arm, self._calibration_arm_drawn = arm
 
-    def _probe_local_prefill_work(self) -> tuple[bool, int]:
+    def _run_dry_admission_pass(self) -> _DryPass:
         budget = self.max_num_batched_tokens
+        result = _DryPass()
         pending = 0
+        num_seqs = 0
         if self._partial_prefill_count:
             for seq in self.running:
+                if num_seqs >= self.max_num_seqs:
+                    break
                 if not seq.is_partial_prefill:
                     continue
                 resume = seq.num_cached_tokens
@@ -1014,106 +1107,235 @@ class Scheduler:
                 if not chunk:
                     break
                 chunk = self._preview_prefill_chunk(seq, start, resume, chunk)
+                result.chunks.append((start, chunk))
                 pending += chunk
+                num_seqs += 1
                 if pending >= budget:
                     break
-        prefillable = pending > 0
-        if pending >= budget or len(self.running) >= self.max_num_seqs:
-            return prefillable, min(pending, budget)
-        # The scan ends where admission's would: the budget filled (`pending`
-        # counts each probed seq's chunk, the rows its forward computes), the
-        # slots used, or the first seq admission stops at. A cache hit's chunk
-        # is its uncached rows, not `seq.num_tokens`: bounding the scan by
-        # prompt length stopped it after one long, mostly cached prompt and
-        # reported a few thousand rows of fill where admission packs the
-        # whole budget. The prefix walk is memoised across ticks.
-        slots = self.max_num_seqs - len(self.running)
-        # What the seqs counted so far take from the pool: admission allocates
-        # them one after another, so each later seq fits only in what the
-        # earlier ones leave (Phase 2 stops at the first refusal).
-        reserved_blocks = 0
-        reserved_state_slots = 0
+        result.prefillable = pending > 0
+        # Phase 2's loop, without its writes: the seqs it would reject, hand to
+        # first decode, or resolve from a remote load are not prefill this pass
+        # (`_waiting_prefills` passes over them). Not asked: the connector's
+        # `admission_ready` (it registers the request on a PD producer) and the
+        # `delay_factor` gate (it reads and resets the prompt latency clock).
+        dry = _DryAdmission()
+        num_running = len(self.running)
+        waiters = 0
+        bypass_left = min(16, self.max_num_seqs)
         for seq in self._waiting_prefills():
-            offload_resume = self._is_offload_prefill_resume(seq)
-            if offload_resume:
-                resume = self._offload_prefill_start(seq)
-                # A replayed hit resumes as one, as admission starts it.
-                cached = self.block_manager.replay_start(
-                    seq, resume, hit=self.block_manager.tier_resume_replays(seq)
-                )
-            else:
-                # The exact probe's answer; the walk is memoised across ticks.
-                demand: list[int] = []
-                cached_blocks = self.block_manager.can_allocate_memoized(
-                    seq,
-                    reserved_blocks=reserved_blocks,
-                    reserved_state_slots=reserved_state_slots,
-                    demand=demand,
-                    observe=False,
-                )
-                if cached_blocks < 0:
-                    break  # Phase 2 also stops at the first allocation refusal.
-                if slots <= self._num_parked_remote_kv:
-                    # A connector query can pin remote KV, so leave it to
-                    # admission. Do not count uncertain remote-slot fit as
-                    # fill or mistake an individually fitting request for idle.
-                    prefillable = True
-                    break
-                resume = cached_blocks * self.block_manager.hash_block_size
-                # Seqs admission passes over rather than prefills this pass
-                # (`prefix_waiters`): a pending tier lookup it cannot detach, or
-                # a hybrid producer's prompt-end checkpoint still in flight.
-                if (
-                    self.kv_connector is not None
-                    and self._offload_lookup_pending(seq)
-                    and not (
-                        self._lookup_detach_enabled(seq)
-                        and self._can_detach_tier_lookup(
-                            seq, AdmissionProbe(cached_blocks)
-                        )
-                    )
-                ):
-                    continue
-                if self._local_prefill_coalescing and self._wait_for_inflight_prefix(
-                    seq,
-                    max(resume, seq.offload_joint.kv_prefix_tokens),
-                    peek=True,
-                ):
-                    continue
-                cached = self.block_manager.replay_start(seq, resume, hit=True)
-            remaining = (
-                seq.num_tokens - cached
-                if offload_resume
-                else self._new_prefill_tokens(seq, cached, resume)
-            )
-            atomic = self._requires_atomic_prefill(seq)
-            if atomic:
-                kind = ChunkKind.WHOLE
-            else:
-                kind = ChunkKind.NEXT if offload_resume else ChunkKind.FIRST
-            chunk = self._prefill_chunk_for_budget(
-                remaining, budget - pending, pending, history_len=cached, kind=kind
-            )
             if (
-                chunk is None
-                or (atomic and chunk < remaining)
-                or self._waits_below_resume(seq, cached, chunk, resume)
+                pending >= budget
+                or num_seqs >= self.max_num_seqs
+                or num_running >= self.max_num_seqs
             ):
                 break
-            chunk = self._preview_prefill_chunk(seq, cached, resume, chunk)
-            prefillable = True
-            pending += chunk
-            slots -= 1
-            if not offload_resume:
-                # An offload resume already holds its blocks (pre-park allocate).
-                reserved_blocks += demand[0] if demand else 0
-                if seq.has_per_req_cache:
-                    reserved_state_slots += self.block_manager.state_slots_per_req
-            if pending >= budget:
-                return True, budget
-            if slots == 0:
+            if waiters:
+                if bypass_left == 0:
+                    break
+                bypass_left -= 1
+            decision = self._decide_waiting_seq(seq, pending, num_running, dry)
+            if decision.verdict is _Verdict.WAIT:
+                waiters += 1
+                continue
+            if decision.verdict is _Verdict.UNKNOWN:
+                result.prefillable = True
                 break
-        return prefillable, pending
+            if decision.verdict is _Verdict.STOP:
+                break
+            chunk = self._preview_prefill_chunk(
+                seq, decision.start, decision.resume, decision.chunk
+            )
+            if decision.verdict is _Verdict.ADMIT:
+                # An offload resume already holds its blocks.
+                self.block_manager.reserve(dry.reserved, seq, decision.hbm_probe)
+                dry.admitted.append((seq, decision.start))
+            self._commit_calibration_arm()
+            result.chunks.append((decision.start, chunk))
+            result.prefillable = True
+            pending += chunk
+            num_seqs += 1
+            num_running += 1
+        return result
+
+    def _decide_waiting_seq(
+        self,
+        seq: Sequence,
+        num_batched_tokens: int,
+        num_running: int,
+        dry: _DryAdmission | None = None,
+    ) -> _WaitingSeqDecision:
+        """Phase 2's decision for one waiting seq, before anything is
+        allocated: whether it is admitted (and its first chunk), passed over,
+        or ends the pass. The real admission and the dry pass
+        (`_dry_admission_pass`) both ask it, so the fill probe and the DP cost
+        estimate follow admission's rules by construction.
+
+        `seq` is past admission's status gates: not aborted, schedulable, not
+        parked for a remote load, and not a PD consumer's first decode.
+        `num_running` counts `running` plus what this pass admitted.
+
+        With `dry` it writes nothing outside `seq`'s admission hints, which the
+        real admission rewrites before it reads them (see `_evaluate`): the
+        fit is asked of the pool `dry.reserved` leaves, the connector is not
+        queried, and a producer wait starts no deadline. Without it, it makes
+        the real admission's connector query (`_query_connector_prefill_match`)
+        and starts the producer wait, as admission always has, in its order.
+        """
+        bm = self.block_manager
+        reserved = dry.reserved if dry is not None else None
+        if self._is_offload_prefill_resume(seq):
+            # Blocks already held from the pre-park allocate; only the batch
+            # budget is asked. No re-match / re-allocate / re-park.
+            resume = self._offload_prefill_start(seq)
+            replayed = bm.tier_resume_replays(seq)
+            start = bm.replay_start(seq, resume, hit=replayed)
+            num_new_tokens = seq.num_tokens - start
+            budget_remaining = self._prefill_room(num_batched_tokens, start)
+            chunk = self._prefill_chunk_for_budget(
+                num_new_tokens,
+                budget_remaining,
+                num_batched_tokens,
+                history_len=start,
+                # Admitted (and sized as FIRST) before it parked for the load.
+                kind=(
+                    ChunkKind.WHOLE
+                    if self._requires_atomic_prefill(seq)
+                    else ChunkKind.NEXT
+                ),
+            )
+            if chunk is None or self._waits_below_resume(seq, start, chunk, resume):
+                return _WaitingSeqDecision(_Verdict.STOP)
+            return _WaitingSeqDecision(
+                _Verdict.RESUME,
+                start=start,
+                resume=resume,
+                chunk=chunk,
+                num_new_tokens=num_new_tokens,
+                budget_remaining=budget_remaining,
+                replayed=replayed,
+            )
+
+        # Side-effect free: the lookup is detached only after `allocate`, so a
+        # request held back by the budget or the pool keeps its prefetched
+        # lookup for the next pass. The HBM probe it needs is kept and reused
+        # by the admission probe below.
+        hbm_probe = None
+        probed_tier_kv = (0, 0)
+        lookup_detachable = False
+        if self._lookup_detach_enabled(seq):
+            hbm_probe = self._probe_hbm_prefix(seq, reserved)
+            probed_tier_kv = self._tier_hit(seq)
+            lookup_detachable = self._can_detach_tier_lookup(seq, hbm_probe)
+        # Before the fit: a seq whose lookup is pending is passed over whether
+        # or not it fits.
+        if (
+            not lookup_detachable
+            and self.kv_connector is not None
+            and self._offload_lookup_pending(seq)
+        ):
+            return _WaitingSeqDecision(_Verdict.WAIT)
+        if dry is None:
+            needs_remote_load = self._query_connector_prefill_match(
+                seq, skip=lookup_detachable
+            )
+        elif num_running + self._num_parked_remote_kv >= self.max_num_seqs:
+            # The query can pin remote KV and take a parked slot; with none
+            # left the answer decides between admitting and stopping.
+            return _WaitingSeqDecision(_Verdict.UNKNOWN)
+        else:
+            # The query's side effects (a tier lookup, its pins, the load
+            # lifecycle) are admission's alone. A dry pass reads the last
+            # answer the seq kept (`offload_joint.kv_prefix_tokens`, which
+            # `_replay_hit` and the producer wait below read) and counts the
+            # seq's rows as a local prefill.
+            needs_remote_load = False
+
+        if (
+            needs_remote_load
+            and num_running + self._num_parked_remote_kv >= self.max_num_seqs
+        ):
+            return _WaitingSeqDecision(_Verdict.STOP)
+
+        # Probe cache hits FIRST so budget check sees the real
+        # (post-prefix-cache) remaining token count. V4 SWA correctness is
+        # enforced inside can_allocate (_swa_bounded_hit bounds the hit to
+        # where the trailing-window SWA is present); no post-hoc warmup trim.
+        # The detach probe predates `_query_connector_prefill_match`, and
+        # `can_allocate` reads the tier's answer (a replaying hit resumes at
+        # the tier hit or extends to its KV-only reach) and records the
+        # replay on `seq` -- for a replaying model only. Probe again if
+        # that answer moved.
+        if hbm_probe is None or (
+            getattr(bm, "state_replay_tokens", 0)
+            and seq.has_per_req_cache
+            and self._tier_hit(seq) != probed_tier_kv
+        ):
+            hbm_probe = self._probe_hbm_prefix(seq, reserved)
+        num_cached_blocks = hbm_probe.num_cached_blocks
+        if num_cached_blocks < 0:
+            return _WaitingSeqDecision(_Verdict.STOP)
+        if seq.replay_kv_load and not needs_remote_load:
+            if dry is not None:
+                # It parks for the load once allocated, with no rows this
+                # pass, if the connector agrees (`_confirm_remote_load_after_alloc`).
+                return _WaitingSeqDecision(_Verdict.UNKNOWN)
+            if num_running + self._num_parked_remote_kv >= self.max_num_seqs:
+                # A replay that loads its KV first parks for that load like any
+                # remote load (`needs_remote_load` knew only the state-carrying
+                # hit), so it needs a parked slot too.
+                return _WaitingSeqDecision(_Verdict.STOP)
+
+        # Use num_tokens (not num_prompt_tokens) so preempted seqs re-forward
+        # their decoded tokens — preempt() frees their KV blocks but keeps
+        # the token_ids, so num_tokens > num_prompt_tokens and those tokens
+        # still need KV recomputed.
+        # From where the forward will really start: a replayed hit starts
+        # below itself (`BlockManager.replay_start`), and its budget counts
+        # the rows it recomputes.
+        resume = num_cached_blocks * bm.hash_block_size
+        start = bm.replay_start(seq, resume, hit=True)
+        num_new_tokens = self._new_prefill_tokens(seq, start, resume)
+        if (
+            self._local_prefill_coalescing
+            and (not needs_remote_load or self._connector_flag("is_offload"))
+            and self._wait_for_inflight_prefix(
+                seq, max(resume, seq.offload_joint.kv_prefix_tokens), dry
+            )
+        ):
+            return _WaitingSeqDecision(_Verdict.WAIT)
+        atomic_prefill = self._requires_atomic_prefill(seq)
+        budget_remaining = self._prefill_room(num_batched_tokens, start)
+        # `start` comes from the hit `can_allocate` offered, before
+        # `allocate` may disown the boundary. The worker fits
+        # `batch.num_cached_tokens`, which `_resume_prefill` sets from the
+        # hit kept after that. Sizing has to happen before allocate, so a
+        # cache-hit's first chunk is solved against an upper bound on the
+        # prefix it will actually run.
+        chunk = self._prefill_chunk_for_budget(
+            num_new_tokens,
+            budget_remaining,
+            num_batched_tokens,
+            history_len=start,
+            kind=ChunkKind.WHOLE if atomic_prefill else ChunkKind.FIRST,
+        )
+        if (
+            chunk is None
+            or (atomic_prefill and chunk < num_new_tokens)
+            or self._waits_below_resume(seq, start, chunk, resume)
+        ):
+            return _WaitingSeqDecision(_Verdict.STOP)
+        return _WaitingSeqDecision(
+            _Verdict.ADMIT,
+            start=start,
+            resume=resume,
+            chunk=chunk,
+            num_new_tokens=num_new_tokens,
+            budget_remaining=budget_remaining,
+            atomic=atomic_prefill,
+            hbm_probe=hbm_probe,
+            lookup_detachable=lookup_detachable,
+            needs_remote_load=needs_remote_load,
+        )
 
     @staticmethod
     def _waits_below_resume(seq: Sequence, start: int, chunk: int, resume: int) -> bool:
@@ -1200,54 +1422,13 @@ class Scheduler:
         room = max(room, self._balance_min_tokens - batched_tokens)
         return max(min(room, cap_room), 0)
 
-    def _estimate_prefill_chunk_cost(self) -> float:
-        """Cost of the chunk this rank would prefill with the whole batch
-        budget: resumable partials first, then the head of `waiting`, probing
-        the prefix cache without recording (`can_allocate_memoized`). An
-        estimate -- the real admission may park or skip some of these seqs."""
-        token_cap = self.max_num_batched_tokens
-        tokens, cost = 0, 0.0
-        if self._partial_prefill_count > 0:
-            for seq in self.running:
-                if not seq.is_partial_prefill:
-                    continue
-                remaining = seq.num_tokens - seq.num_cached_tokens
-                # A continued replay's rows below its `until` ride on top.
-                cap_from = max(seq.num_cached_tokens, seq.replay_until)
-                if 0 < self.long_prefill_token_threshold < seq.num_tokens - cap_from:
-                    remaining = (
-                        self.long_prefill_token_threshold
-                        + cap_from
-                        - seq.num_cached_tokens
-                    )
-                k = min(remaining, token_cap - tokens)
-                if k <= 0:
-                    return cost
-                cost += self._chunk_cost(seq.num_cached_tokens, k)
-                tokens += k
-        for seq in itertools.islice(self._waiting_prefills(), self.max_num_seqs):
-            if tokens >= token_cap:
-                break
-            if self._is_offload_prefill_resume(seq):
-                resume = seq.num_cached_tokens
-                start = self.block_manager.replay_start(
-                    seq, resume, hit=self.block_manager.tier_resume_replays(seq)
-                )
-            else:
-                # Runs on every tick with prefill work, holds included: reuse
-                # the walk across ticks; the answer is the exact probe's.
-                cached_blocks = self.block_manager.can_allocate_memoized(seq)
-                if cached_blocks < 0:
-                    break
-                # From where the forward will really start, as admission
-                # budgets it: a replayed hit starts below itself.
-                resume = cached_blocks * self.block_manager.hash_block_size
-                start = self.block_manager.replay_start(seq, resume, hit=True)
-            k = min(self._new_prefill_tokens(seq, start, resume), token_cap - tokens)
-            if k > 0:
-                cost += self._chunk_cost(start, k)
-                tokens += k
-        return cost
+    def _estimate_prefill_chunk_cost(self, dry_pass: _DryPass | None = None) -> float:
+        """Cost of the prefill this rank would schedule with the whole batch
+        budget: the dry pass's chunks (`_dry_admission_pass`), the same the
+        fill probe counts."""
+        if dry_pass is None:
+            dry_pass = self._dry_admission_pass()
+        return sum(self._chunk_cost(start, rows) for start, rows in dry_pass.chunks)
 
     def _balance_prefill_step(self, own: float) -> None:
         """Set this prefill step's cost target from every DP rank's chunk cost.
@@ -1367,8 +1548,8 @@ class Scheduler:
                 # with (`replays_hit`), which decide how it resumes.
                 return True
             # KV-pressured requests definitely cannot prefill. A fit probe, not
-            # an admission: it records nothing, and runs every tick, so the
-            # walk is memoised across ticks.
+            # an admission: it commits nothing (`record=False`), and runs every
+            # tick, so the walk is memoised across ticks.
             return self.block_manager.can_allocate_memoized(seq) >= 0
         return False
 
@@ -2051,6 +2232,8 @@ class Scheduler:
             running_decode_batch = max(
                 0, len(self.running) - self._partial_prefill_count
             )
+            # The fill probe's dry pass, shared with the cost estimate below.
+            dry_pass = None
             protects_decode = self.prefill_delayer.protects_decode(running_decode_batch)
             if protects_decode or (
                 self._local_prefill_coalescing and not running_decode_batch
@@ -2064,7 +2247,8 @@ class Scheduler:
                 )
                 pending_tokens = 0
             elif self._local_prefill_coalescing:
-                prefillable, pending_tokens = self._local_prefill_pending_work()
+                dry_pass = self._dry_admission_pass()
+                prefillable, pending_tokens = self._local_prefill_pending_work(dry_pass)
             else:
                 prefillable = self._can_admit_head_prefill()
                 pending_tokens = min(
@@ -2078,7 +2262,7 @@ class Scheduler:
             # holds there depends on every rank's decode load, known only after
             # the reduce (with no decode anywhere it fires through that window).
             prefill_cost = (
-                self._estimate_prefill_chunk_cost()
+                self._estimate_prefill_chunk_cost(dry_pass)
                 if self.cost_balance and prefillable
                 else 0.0
             )
@@ -2220,45 +2404,12 @@ class Scheduler:
             )
             if remote_ready_for_decode is None:
                 continue
-
-            offload_resume = self._is_offload_prefill_resume(seq)
-            # Side-effect free: the lookup is detached only after `allocate`
-            # below, so a request held back by the budget or the pool keeps
-            # its prefetched lookup for the next pass. The HBM probe it needs
-            # is kept and reused by the admission probe below.
-            hbm_probe = None
-            probed_tier_kv = (0, 0)
-            lookup_detachable = False
-            if (
-                not remote_ready_for_decode
-                and not offload_resume
-                and self._lookup_detach_enabled(seq)
-            ):
-                hbm_probe = self._probe_hbm_prefix(seq)
-                probed_tier_kv = self._tier_hit(seq)
-                lookup_detachable = self._can_detach_tier_lookup(seq, hbm_probe)
-            if (
-                not remote_ready_for_decode
-                and not offload_resume
-                and not lookup_detachable
-                and self.kv_connector is not None
-                and self._offload_lookup_pending(seq)
-            ):
-                prefix_waiters.append(seq)
-                continue
-            needs_remote_load = self._query_connector_prefill_match(
-                seq,
-                skip=remote_ready_for_decode or offload_resume or lookup_detachable,
-            )
-
             if remote_ready_for_decode:
                 self._schedule_first_decode_after_remote_kv(seq)
                 continue
 
+            offload_resume = self._is_offload_prefill_resume(seq)
             if offload_resume:
-                # Blocks already held from the pre-park allocate; only re-check
-                # the batch budget. No re-match / re-allocate / re-park.
-                #
                 # `num_tokens`, like Phase 1 above and the non-offload branch
                 # below. A seq re-admitted after `preempt` owes KV for the
                 # tokens it had already generated, and the offload load can
@@ -2285,34 +2436,29 @@ class Scheduler:
                     # costs one block of forward, and the forward has to happen
                     # regardless: the first decode samples from the logits this
                     # prefill produces, and there is nowhere else to get them.
+                    # (`_decide_waiting_seq` sizes from the same start.)
                     seq.num_cached_tokens = self._offload_prefill_start(seq)
+
+            decision = self._decide_waiting_seq(
+                seq, num_batched_tokens, len(self.running)
+            )
+            if decision.verdict is _Verdict.WAIT:
+                prefix_waiters.append(seq)
+                continue
+            if decision.verdict is _Verdict.STOP:
+                self.waiting.appendleft(seq)
+                break
+            chunk = decision.chunk
+            num_new_tokens = decision.num_new_tokens
+            budget_remaining = decision.budget_remaining
+
+            if decision.verdict is _Verdict.RESUME:
                 # A replayed hit resumes as one: its state slot is fresh, so
                 # the forward replays below where the load left
                 # `num_cached_tokens` -- the KV-only reach, or the HBM hit if
                 # the load did not run (`Sequence.replay_kv_load`).
-                replayed = self.block_manager.tier_resume_replays(seq)
-                start = self.block_manager.replay_start(
-                    seq, seq.num_cached_tokens, hit=replayed
-                )
-                num_new_tokens = seq.num_tokens - start
-                budget_remaining = self._prefill_room(num_batched_tokens, start)
-                chunk = self._prefill_chunk_for_budget(
-                    num_new_tokens,
-                    budget_remaining,
-                    num_batched_tokens,
-                    history_len=start,
-                    # Admitted (and sized as FIRST) before it parked for the load.
-                    kind=(
-                        ChunkKind.WHOLE
-                        if self._requires_atomic_prefill(seq)
-                        else ChunkKind.NEXT
-                    ),
-                )
-                if chunk is None or self._waits_below_resume(
-                    seq, start, chunk, seq.num_cached_tokens
-                ):
-                    self.waiting.appendleft(seq)
-                    break
+                replayed = decision.replayed
+                start = decision.start
                 self._resume_prefill(seq, start, hit=replayed)
                 chunk = self._finalize_prefill_chunk(seq, start, chunk)
                 self._assert_positive_prefill_chunk(
@@ -2344,88 +2490,11 @@ class Scheduler:
                 self._uncount_inflight_load(seq)
                 continue
 
-            if (
-                needs_remote_load
-                and len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs
-            ):
-                self.waiting.appendleft(seq)
-                break
-
-            # Probe cache hits FIRST so budget check sees the real
-            # (post-prefix-cache) remaining token count. V4 SWA correctness is
-            # enforced inside can_allocate (_swa_bounded_hit bounds the hit to
-            # where the trailing-window SWA is present); no post-hoc warmup trim.
-            # The detach probe predates `_query_connector_prefill_match`, and
-            # `can_allocate` reads the tier's answer (a replaying hit resumes at
-            # the tier hit or extends to its KV-only reach) and records the
-            # replay on `seq` -- for a replaying model only. Probe again if
-            # that answer moved.
-            if hbm_probe is None or (
-                getattr(self.block_manager, "state_replay_tokens", 0)
-                and seq.has_per_req_cache
-                and self._tier_hit(seq) != probed_tier_kv
-            ):
-                hbm_probe = self._probe_hbm_prefix(seq)
+            hbm_probe = decision.hbm_probe
             num_cached_blocks = hbm_probe.num_cached_blocks
-            if num_cached_blocks < 0:
-                self.waiting.appendleft(seq)
-                break
-            if (
-                seq.replay_kv_load
-                and not needs_remote_load
-                and len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs
-            ):
-                # A replay that loads its KV first parks for that load like any
-                # remote load (`needs_remote_load` knew only the state-carrying
-                # hit), so it needs a parked slot too.
-                self.waiting.appendleft(seq)
-                break
-
-            # Use num_tokens (not num_prompt_tokens) so preempted seqs re-forward
-            # their decoded tokens — preempt() frees their KV blocks but keeps
-            # the token_ids, so num_tokens > num_prompt_tokens and those tokens
-            # still need KV recomputed.
-            # From where the forward will really start: a replayed hit starts
-            # below itself (`BlockManager.replay_start`), and its budget counts
-            # the rows it recomputes.
-            resume = num_cached_blocks * self.block_manager.hash_block_size
-            start = self.block_manager.replay_start(seq, resume, hit=True)
-            num_new_tokens = self._new_prefill_tokens(seq, start, resume)
-            if (
-                self._local_prefill_coalescing
-                and (not needs_remote_load or self._connector_flag("is_offload"))
-                and self._wait_for_inflight_prefix(
-                    seq,
-                    max(
-                        num_cached_blocks * self.block_manager.hash_block_size,
-                        seq.offload_joint.kv_prefix_tokens,
-                    ),
-                )
-            ):
-                prefix_waiters.append(seq)
-                continue
-            atomic_prefill = self._requires_atomic_prefill(seq)
-            budget_remaining = self._prefill_room(num_batched_tokens, start)
-            # `start` comes from the hit `can_allocate` offered, before
-            # `allocate` may disown the boundary. The worker fits
-            # `batch.num_cached_tokens`, which `_resume_prefill` sets from the
-            # hit kept after that. Sizing has to happen before allocate, so a
-            # cache-hit's first chunk is solved against an upper bound on the
-            # prefix it will actually run.
-            chunk = self._prefill_chunk_for_budget(
-                num_new_tokens,
-                budget_remaining,
-                num_batched_tokens,
-                history_len=start,
-                kind=ChunkKind.WHOLE if atomic_prefill else ChunkKind.FIRST,
-            )
-            if (
-                chunk is None
-                or (atomic_prefill and chunk < num_new_tokens)
-                or self._waits_below_resume(seq, start, chunk, resume)
-            ):
-                self.waiting.appendleft(seq)
-                break
+            lookup_detachable = decision.lookup_detachable
+            needs_remote_load = decision.needs_remote_load
+            atomic_prefill = decision.atomic
             self.block_manager.record_allocation(seq, hbm_probe)
             if not self.block_manager.allocate(seq, num_cached_blocks):
                 # A state-less joint boundary could not be privatised without
@@ -3169,19 +3238,26 @@ class Scheduler:
             or (seq.kv_transfer_params or {}).get("do_remote_prefill")
         )
 
-    def _probe_hbm_prefix(self, seq: Sequence) -> AdmissionProbe:
+    def _probe_hbm_prefix(
+        self, seq: Sequence, reserved: PoolReservation | None = None
+    ) -> AdmissionProbe:
         """`can_allocate(record=False)`: the HBM hit in blocks (-1 if the
         request does not fit), the hash chain it walked and the demand its fit
         passed, which `record_allocation` commits.
 
         Done once per admission attempt; the result is shared by the detach
         decision and the admission itself, which run in the same pass with no
-        pool change in between.
+        pool change in between. A dry pass (`reserved`) asks the memoised
+        walk against the pool its admitted seqs leave; its probe carries no
+        chain and is never committed.
         """
         probe = AdmissionProbe()
-        probe.num_cached_blocks = self.block_manager.can_allocate(
-            seq, record=False, probe=probe
-        )
+        if reserved is None:
+            probe.num_cached_blocks = self.block_manager.can_allocate(
+                seq, record=False, probe=probe
+            )
+        else:
+            self.block_manager.can_allocate_memoized(seq, probe, reserved)
         return probe
 
     @staticmethod
