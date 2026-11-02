@@ -113,7 +113,7 @@ jobs:
         # these. Installed only now, so it does not change what that run sees.
         run: |
           pip3 install triton==3.8.0
-          python -m pytest -q -rs tests/model_ops/test_topk_softmax_triton.py -k interpreter
+          python -m pytest -q -rs tests/model_ops/test_topk_softmax_triton.py
       - name: Upload JUnit report
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7

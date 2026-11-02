@@ -43,6 +43,36 @@ import triton.language as tl
 
 from atom.utils.custom_register import direct_register_custom_op
 
+# Largest batch, in rows, that runs the Triton softmax top-k router. Not a
+# measured crossover: the Triton router has been timed against AITER only up to
+# 128 tokens (and on an earlier version of the kernel); the GPU sweep decides
+# whether this moves.
+_TRITON_TOPK_MAX_ROWS = 128
+
+
+def use_triton_topk_softmax(
+    triton_softmax_router: bool,
+    rows: int,
+    num_fused_shared_experts: int,
+    fused_shared_experts_scoring_func: str | None,
+) -> bool:
+    """Whether a softmax routing call takes the Triton router instead of AITER
+    ``topk_softmax``: the model opted in (``FusedMoE(triton_softmax_router=
+    True)``, Qwen3-Next / Qwen3.5), the fused shared expert, if any, is
+    sigmoid-scored, and the batch has at most ``_TRITON_TOPK_MAX_ROWS`` rows.
+
+    ``rows`` is the row count the kernels run on, padding rows included: under
+    a CUDA graph the choice is made once at capture for the padded batch and
+    replays for every smaller real count, and both kernels launch work for
+    every row, so the padded count is also the one their cost follows.
+    """
+    return (
+        triton_softmax_router
+        and fused_shared_experts_scoring_func in (None, "", "sigmoid")
+        and num_fused_shared_experts <= 1
+        and rows <= _TRITON_TOPK_MAX_ROWS
+    )
+
 
 @triton.jit
 def _topk_softmax_kernel(

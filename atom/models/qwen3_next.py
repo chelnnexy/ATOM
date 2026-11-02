@@ -252,6 +252,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.experts",
             config=config,
             shared_expert_prefix=f"{prefix}.shared_expert",
+            # Qwen3-Next / Qwen3.5 (512 experts, sigmoid-gated fused shared
+            # expert): the shape the Triton softmax router was written for.
+            triton_softmax_router=True,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

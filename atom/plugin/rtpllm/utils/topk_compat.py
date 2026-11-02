@@ -51,12 +51,14 @@ def rtp_topk_softmax(
     num_routing_experts: int = 0,
     fused_shared_experts_scoring_func: str | None = None,
     num_valid_rows: torch.Tensor | None = None,
+    triton_softmax_router: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from aiter import topk_softmax
 
     from atom.model_ops import topK
 
-    del num_routing_experts
+    # RTP's pinned AITER path; the Triton router is not used here.
+    del num_routing_experts, triton_softmax_router
     token = gating_output.shape[0]
     if num_fused_shared_experts > 0:
         total_weights, total_ids = topK.topk_meta_rows(token)

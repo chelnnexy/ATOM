@@ -3,15 +3,16 @@
 """The Triton softmax top-k router (``atom/model_ops/triton_topk_softmax.py``).
 
 ``rocm_aiter_topk_softmax_impl`` runs it in place of AITER ``topk_softmax`` for
-the Qwen3-Next / Qwen3.5 routing shape (512 routed experts + one sigmoid-scored
-fused shared expert, at most 128 tokens), so it has to give AITER's outputs:
+models that opt in (Qwen3-Next / Qwen3.5: 512 routed experts + one
+sigmoid-scored fused shared expert), at most 128 rows, so it has to give AITER's outputs:
 the same expert ids (lowest id on ties), the same weights, sigmoid
 shared-expert weights, and -1 / 0 on rows at or past ``num_valid_rows``.
 
 The interpreter test runs the kernel under ``TRITON_INTERPRET=1`` in a
 subprocess (the interpreter is chosen when the module is imported) against a
-torch reference; it needs only ``triton`` and CPU torch, and the CI unit job
-runs it in its own step after installing ``triton``. The GPU tests compare the
+torch reference; it and the gate tests need only ``triton`` and CPU torch,
+and the CI unit job runs this file in its own step after installing
+``triton``. The GPU tests compare the
 kernel with AITER's, including under ``torch.compile``.
 """
 
@@ -130,7 +131,100 @@ def test_triton_router_matches_reference_in_interpreter():
     assert proc.stdout.strip().endswith("ok")
 
 
+# AITER probes the device when imported, so tests that import topK / moe need
+# the GPU environment even when their tensors live on the CPU.
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+
+
+@pytest.mark.parametrize(
+    ("opt_in", "rows", "shared", "scoring", "expected"),
+    [
+        (True, 4, 1, "sigmoid", True),  # Qwen3-Next / Qwen3.5 decode
+        (True, 128, 1, "sigmoid", True),
+        (True, 129, 1, "sigmoid", False),  # above the cap
+        (True, 4, 0, None, True),  # fusion off: plain softmax top-k
+        (True, 4, 1, "", True),  # shared column not scored by the kernel
+        (True, 4, 2, "sigmoid", False),  # more shared columns than written for
+        (True, 4, 1, "softplus", False),  # scoring the kernel does not have
+        (False, 4, 1, "sigmoid", False),  # model did not opt in (e.g. Qwen3.8)
+        (False, 4, 0, None, False),
+    ],
+)
+def test_gate_picks_triton_only_for_opted_in_models(
+    opt_in, rows, shared, scoring, expected
+):
+    pytest.importorskip("triton")
+    from atom.model_ops.triton_topk_softmax import use_triton_topk_softmax
+
+    assert use_triton_topk_softmax(opt_in, rows, shared, scoring) is expected
+
+
+@gpu
+@pytest.mark.parametrize(("padded_rows", "expected"), [(128, True), (136, False)])
+def test_gate_counts_padded_rows(monkeypatch, padded_rows, expected):
+    """The gate sees the batch's padded row count, not ``num_valid_rows``: the
+    real count lives on the device, and a captured graph serves every real
+    count up to its padded size with the kernel chosen at capture."""
+    pytest.importorskip("aiter")
+    import aiter
+
+    import atom.model_ops.topK as topK_mod
+    from atom.model_ops import triton_topk_softmax as tts
+
+    calls = []
+    monkeypatch.setattr(
+        tts,
+        "triton_topk_softmax_op",
+        lambda *a: calls.append(("triton", a[-1])),
+    )
+    monkeypatch.setattr(
+        aiter, "topk_softmax", lambda *a: calls.append(("aiter", a[-1]))
+    )
+    logits = torch.zeros(padded_rows, N_ROUTED)
+    valid = torch.tensor([3], dtype=torch.int32)  # 3 real rows in the batch
+    for opt_in in (True, False):
+        topK_mod.rocm_aiter_topk_softmax_impl(
+            logits,
+            TOP_K,
+            True,
+            num_valid_rows=valid,
+            triton_softmax_router=opt_in,
+        )
+    path = "triton" if expected else "aiter"
+    assert calls == [(path, valid), ("aiter", valid)]
+
+
+@gpu
+def test_moe_routing_passes_the_layer_opt_in(monkeypatch):
+    """FusedMoE(triton_softmax_router=...) reaches the softmax routing call."""
+    pytest.importorskip("aiter")
+    from types import SimpleNamespace
+
+    from atom.model_ops import moe
+
+    seen = {}
+    monkeypatch.setattr(
+        moe.FusedMoE,
+        "select_experts",
+        staticmethod(lambda **kw: seen.update(kw)),
+    )
+    layer = SimpleNamespace(
+        use_grouped_topk=False,
+        top_k=TOP_K,
+        renormalize=True,
+        topk_group=None,
+        num_expert_group=None,
+        custom_routing_function=None,
+        scoring_func="softmax",
+        e_score_correction_bias=None,
+        shared_expert_scoring_func="sigmoid",
+        routed_scaling_factor=1.0,
+        use_ep=False,
+    )
+    for opt_in in (True, False):
+        layer.triton_softmax_router = opt_in
+        moe._select_logical(layer, None, None, N_ROUTED, 1)
+        assert seen["triton_softmax_router"] is opt_in
 
 
 @pytest.fixture
@@ -238,6 +332,7 @@ def test_fused_shared_topk_reads_padded_stride_logits(topk_mod, tokens, dtype):
             num_fused_shared_experts=1,
             num_routing_experts=N_ROUTED,
             fused_shared_experts_scoring_func="sigmoid",
+            triton_softmax_router=True,
         )
         return w.clone(), ids.clone()
 
@@ -266,6 +361,7 @@ def test_triton_router_cuda_graph_replay(topk_mod):
             num_routing_experts=N_ROUTED,
             fused_shared_experts_scoring_func="sigmoid",
             num_valid_rows=valid,
+            triton_softmax_router=True,
         )
 
     route()  # compile outside capture
@@ -300,6 +396,7 @@ def test_fused_shared_topk_under_torch_compile(topk_mod):
             num_routing_experts=N_ROUTED,
             fused_shared_experts_scoring_func="sigmoid",
             num_valid_rows=valid,
+            triton_softmax_router=True,
         )
         return w.clone(), ids.clone()
 

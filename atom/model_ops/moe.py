@@ -526,6 +526,7 @@ def _select_logical(
         # TODO: a -1 route faults the TP a16w4 MoE; until that consumer is
         # found, pure TP routes and runs its pad rows like real ones.
         mask_pad_rows=layer.use_ep,
+        triton_softmax_router=getattr(layer, "triton_softmax_router", False),
     )
 
 
@@ -3498,6 +3499,7 @@ class FusedMoE(torch.nn.Module):
         shared_expert_scoring_func: str | None = None,
         config: PretrainedConfig | None = None,
         shared_expert_prefix: str | None = None,
+        triton_softmax_router: bool = False,
         pad_align: int | None = None,
         enable_comm_fused: bool = False,
         mxfp4_fp8_activations: bool = False,
@@ -3614,6 +3616,9 @@ class FusedMoE(torch.nn.Module):
             self.local_num_experts = self.global_num_experts
         self.top_k = top_k
         self.shared_expert_scoring_func = shared_expert_scoring_func
+        # The model opts in to atom/model_ops/triton_topk_softmax.py for its
+        # softmax routing; see rocm_aiter_topk_softmax_impl for when it runs.
+        self.triton_softmax_router = triton_softmax_router
         self.routed_scaling_factor = (
             getattr(config, "routed_scaling_factor", 1.0)
             if config is not None and atom_config.torch_dtype != torch.float16
@@ -5203,6 +5208,7 @@ class FusedMoE(torch.nn.Module):
         fused_shared_experts_scoring_func: str | None = None,
         routed_scaling_factor: float = 1.0,
         mask_pad_rows: bool = True,
+        triton_softmax_router: bool = False,
     ):
 
         # custom_routing_function takes precedence (e.g. DeepSeek-V4 hash routing
@@ -5251,6 +5257,7 @@ class FusedMoE(torch.nn.Module):
                     num_routing_experts=num_routing_experts,
                     fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
                     num_valid_rows=num_valid_rows,
+                    triton_softmax_router=triton_softmax_router,
                 )
             elif scoring_func in ("sigmoid", "sqrtsoftplus"):
                 tokens_num = router_logits.shape[0]

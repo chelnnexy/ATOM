@@ -8,6 +8,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
+from atom.model_ops.triton_topk_softmax import use_triton_topk_softmax
 from atom.model_ops.utils import _has_module
 from atom.quant_spec import fuses_mxfp8_shared_into_mxfp4
 from atom.utils import envs
@@ -201,11 +202,6 @@ def reassign_gathered_shared_ids(layer, topk_ids: torch.Tensor) -> None:
     topk_ids[:, top_k:] = total_topk_ids[:rows, top_k:]
 
 
-# Scope of the Triton softmax top-k router (see rocm_aiter_topk_softmax_impl).
-_TRITON_TOPK_ROUTED_EXPERTS = 512
-_TRITON_TOPK_MAX_TOKENS = 128
-
-
 def rocm_aiter_topk_softmax_impl(
     gating_output: torch.Tensor,
     topk: int,
@@ -214,6 +210,7 @@ def rocm_aiter_topk_softmax_impl(
     num_routing_experts: int = 0,
     fused_shared_experts_scoring_func: str | None = None,
     num_valid_rows: torch.Tensor | None = None,
+    triton_softmax_router: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from aiter import topk_softmax
 
@@ -232,15 +229,11 @@ def rocm_aiter_topk_softmax_impl(
         fused_shared_experts_for_kernel = 0
     else:
         fused_shared_experts_for_kernel = num_fused_shared_experts
-    # The Triton router is only enabled where it was timed against AITER:
-    # 512 routed experts plus one sigmoid-scored fused shared expert
-    # (Qwen3-Next / Qwen3.5), at most 128 tokens. Other shapes keep AITER
-    # until measured.
-    if (
-        fused_shared_experts_scoring_func == "sigmoid"
-        and fused_shared_experts_for_kernel == 1
-        and gating_output.shape[1] == _TRITON_TOPK_ROUTED_EXPERTS + 1
-        and token <= _TRITON_TOPK_MAX_TOKENS
+    if use_triton_topk_softmax(
+        triton_softmax_router,
+        token,
+        num_fused_shared_experts,
+        fused_shared_experts_scoring_func,
     ):
         from atom.model_ops.triton_topk_softmax import triton_topk_softmax_op
 
@@ -456,6 +449,7 @@ def rocm_aiter_topk_softmax(
     num_routing_experts: int = 0,
     fused_shared_experts_scoring_func: str | None = None,
     num_valid_rows: torch.Tensor | None = None,
+    triton_softmax_router: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     return rocm_aiter_topk_softmax_impl(
         gating_output,
@@ -465,6 +459,7 @@ def rocm_aiter_topk_softmax(
         num_routing_experts,
         fused_shared_experts_scoring_func,
         num_valid_rows,
+        triton_softmax_router,
     )
 
 
