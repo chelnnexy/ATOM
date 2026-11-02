@@ -189,16 +189,11 @@ class BlockPool:
         of a whole chain with `map`. Read it per walk, not once per pool."""
         return self._hash_to_block_id.get
 
-    def count_used(
-        self, block_ids: list[int], n: int, also: set[int] | None = None
-    ) -> int:
+    def count_used(self, block_ids: list[int], n: int) -> int:
         """How many of the first `n` of `block_ids` (distinct) some live
-        sequence holds, or `also` names. No slice; the set it builds holds only
-        the used ids, and a waiting head's hit blocks are mostly free."""
-        used = self._used.intersection(islice(block_ids, n))
-        if not also:
-            return len(used)
-        return len(used) + len(also.intersection(islice(block_ids, n)) - used)
+        sequence holds. No slice; the set it builds holds only the used ids,
+        and a waiting head's hit blocks are mostly free."""
+        return len(self._used.intersection(islice(block_ids, n)))
 
     def claim_many(self, block_ids) -> None:
         """`claim` each of `block_ids`, in order, with the lookups hoisted."""
@@ -285,8 +280,9 @@ class BlockPool:
         """The free blocks still holding content, in the order `_take_free`
         spends them once the vacant ones are gone. Read-only; a lazy iterator,
         valid while the pool does not change."""
+        free, blocks = self._free, self.blocks
         for block_id in chain(self._cached, self._protected):
-            if block_id in self._free and self.blocks[block_id].hash != -1:
+            if block_id in free and blocks[block_id].hash != -1:
                 yield block_id
 
     # ---------------------------- allocation ------------------------------- #

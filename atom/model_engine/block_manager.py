@@ -6,7 +6,7 @@ import logging
 from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from itertools import islice
+from itertools import filterfalse, islice
 from math import inf, isinf
 from time import monotonic
 from weakref import WeakKeyDictionary
@@ -136,6 +136,9 @@ class AdmissionProbe:
     num_cached_blocks: int = -1
     block_hashes: list[int] = field(default_factory=list)
     num_new_blocks: int | None = None
+    # With `num_new_blocks`: the hit's free blocks no `PoolReservation` holds,
+    # i.e. those `BlockManager.reserve` takes off the free list by name.
+    num_free_hit_blocks: int = 0
 
 
 @dataclass(slots=True)
@@ -144,10 +147,15 @@ class PoolReservation:
     `allocate` would take it from the pool one seq after another.
 
     `blocks` are pool units (each admitted seq's `num_new_blocks`), and
-    `block_ids` the cached hit blocks among them: a later seq hitting one of
-    those finds it held, as it would after the earlier seq's `allocate`, so a
-    shared free prefix is counted once. `state_slots` are per-request state
-    slots.
+    `hits` the cached hit blocks among them, as (walk ids, hit length) keyed by
+    the first block: a later seq hitting one of those finds it held, as it
+    would after the earlier seq's `allocate`, so a shared free prefix is counted
+    once. A hit is a hash chain, so two hits share a block only at the same
+    position and then share everything before it: the held part of a later hit
+    is its longest common prefix with an earlier one (`_reserved_prefix`), found
+    without building a set of either. `block_ids` is that union as a set, built
+    only for the eviction order (`BlockManager._evictions`). `state_slots` are
+    per-request state slots.
 
     `evicted` are the cached free blocks the admitted seqs' fresh blocks
     would take once the vacant ones are gone (`BlockPool._take_free`'s order):
@@ -159,13 +167,19 @@ class PoolReservation:
     """
 
     blocks: int = 0
+    hits: dict[int, list[tuple[list[int], int]]] = field(default_factory=dict)
     block_ids: set[int] = field(default_factory=set)
+    # Hits not yet added to `block_ids`.
+    unmerged: list[tuple[list[int], int]] = field(default_factory=list)
     state_slots: int = 0
     evicted: set[int] = field(default_factory=set)
     # Fresh blocks taken so far, and where the next one past the vacant ones
     # comes from (an iterator over the free list's cached half, LRU first).
     fresh: int = 0
     evict_cursor: Iterator[int] | None = None
+    # Evictions counted but not yet named: `evicted` is filled from the cursor
+    # only when a later seq has a hit to cut (`BlockManager._evictions`).
+    evict_pending: int = 0
 
 
 # Evicted or remapped hashes kept for `_CachedWalk` revalidation; a memo
@@ -1270,7 +1284,7 @@ class BlockManager:
         # read the WHOLE history, so this stays a full front-to-back chained
         # match). Record each block's hash for the SWA scan below.
         walk = walk_of(seq)
-        if reserved is not None and reserved.evicted:
+        if reserved is not None and walk.ids and self._evictions(reserved):
             walk = self._walk_after_evictions(walk, reserved.evicted)
         if block_hashes is None:
             block_hashes = walk.hashes  # read, never extended, below
@@ -1302,13 +1316,18 @@ class BlockManager:
         # (shared ref); blocks we drop from the hit become fresh → counted.
         # Plus the draft round's lookahead past the prompt, which the scheduler
         # allocates right after `allocate` (`may_append(..., lookahead=)`).
+        # Held = used by a live seq, or by an earlier seq of a dry pass: the
+        # hit's first `shared` blocks (`PoolReservation`).
+        used = self.kv.count_used(walk.ids, num_cached_blocks)
+        shared = (
+            self._reserved_prefix(reserved, walk.ids, num_cached_blocks)
+            if reserved is not None
+            else 0
+        )
+        shared_free = shared - self.kv.count_used(walk.ids, shared) if shared else 0
         num_new_blocks = (
             self._n_hash_blocks(seq)
-            - self.kv.count_used(
-                walk.ids,
-                num_cached_blocks,
-                also=reserved.block_ids if reserved is not None else None,
-            )
+            - (used + shared_free)
             + self.draft_lookahead_blocks(len(seq))
         )
         protected_hash = (
@@ -1335,6 +1354,7 @@ class BlockManager:
         # walking the hit again.
         if probe is not None:
             probe.num_new_blocks = num_new_blocks
+            probe.num_free_hit_blocks = num_cached_blocks - used - shared_free
         # A direct admission commits its joint boundary here. The scheduler
         # probes first and calls record_allocation only after dependency and
         # budget checks; refused probes avoid the extra LMCache hash walk.
@@ -1562,16 +1582,13 @@ class BlockManager:
         if self.enable_prefix_caching and probe.num_cached_blocks > 0:
             walk_of = self._memoised_walk if self.walk_memo else self._walk_prefix
             walk = walk_of(seq)
-            if reserved.evicted:
+            if walk.ids and self._evictions(reserved):
                 walk = self._walk_after_evictions(walk, reserved.evicted)
-            hit_ids = set(islice(walk.ids, probe.num_cached_blocks))
+            hit = (walk.ids, probe.num_cached_blocks)
+            reserved.hits.setdefault(walk.ids[0], []).append(hit)
+            reserved.unmerged.append(hit)
             # The free ones leave the free list as named blocks, not pops.
-            claimed = sum(
-                1
-                for block_id in hit_ids - reserved.block_ids
-                if not self.kv.is_used(block_id)
-            )
-            reserved.block_ids |= hit_ids
+            claimed = probe.num_free_hit_blocks
         self._reserve_fresh(reserved, probe.num_new_blocks - claimed)
 
     def _reserve_fresh(self, reserved: PoolReservation, count: int) -> None:
@@ -1584,19 +1601,56 @@ class BlockManager:
         reserved.fresh += count
         if spill <= 0:
             return
-        if reserved.evict_cursor is None:
-            reserved.evict_cursor = kv.eviction_order()
-        for block_id in reserved.evict_cursor:
-            if block_id in reserved.block_ids:
+        reserved.evict_pending += spill
+
+    @staticmethod
+    def _reserved_prefix(reserved: PoolReservation, ids: list[int], n: int) -> int:
+        """How many of `ids[:n]` (a hit chain) an earlier hit in `reserved`
+        holds: the longest common prefix with one of them. Chains equal at a
+        position are equal before it, so it is a binary search per hit."""
+        if not n or not reserved.hits:
+            return 0
+        best = 0
+        for other, m in reserved.hits.get(ids[0], ()):
+            hi = min(n, m)
+            if hi <= best:
                 continue
-            reserved.evicted.add(block_id)
-            spill -= 1
-            if spill == 0:
-                return
+            lo = 1  # equal first block: the key
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if ids[mid - 1] == other[mid - 1]:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            best = max(best, lo)
+        return best
+
+    def _evictions(self, reserved: PoolReservation) -> set[int]:
+        """`reserved.evicted`, naming the pending evictions first: the next
+        `evict_pending` cached free blocks no admitted seq holds as a hit.
+        Deferred to here because only a later seq's hit reads them, and the
+        hit blocks that skip them are all reserved by then (a seq with a hit
+        names the pending ones before its own `reserve`)."""
+        if reserved.evict_pending:
+            for ids, n in reserved.unmerged:
+                reserved.block_ids.update(islice(ids, n))
+            reserved.unmerged.clear()
+            if reserved.evict_cursor is None:
+                reserved.evict_cursor = self.kv.eviction_order()
+            reserved.evicted.update(
+                islice(
+                    filterfalse(reserved.block_ids.__contains__, reserved.evict_cursor),
+                    reserved.evict_pending,
+                )
+            )
+            reserved.evict_pending = 0
+        return reserved.evicted
 
     @staticmethod
     def _walk_after_evictions(walk: _PrefixWalk, evicted: set[int]) -> _PrefixWalk:
         """`walk` ended before its first block in `evicted`."""
+        if evicted.isdisjoint(walk.ids):
+            return walk
         for i, block_id in enumerate(walk.ids):
             if block_id in evicted:
                 return _PrefixWalk(
