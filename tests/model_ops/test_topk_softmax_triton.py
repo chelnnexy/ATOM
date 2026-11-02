@@ -1,173 +1,282 @@
-"""Triton small-M router matches AITER topk_softmax on the Qwen3.5 routing shape.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+"""The Triton softmax top-k router (``atom/model_ops/triton_topk_softmax.py``).
 
-Qwen3-Next / Qwen3.5 route with softmax top-10 over 512 experts plus one fused
-shared expert whose weight is sigmoid(gate logit 512). At or below
-ATOM_TRITON_TOPK_SOFTMAX_MAX_TOKENS the Triton router replaces AITER's kernel;
-it must give the same ids and weights, return views sliced to the batch, and
-replay correctly from a CUDA graph.
+``rocm_aiter_topk_softmax_impl`` runs it in place of AITER ``topk_softmax`` for
+softmax routing with no or sigmoid-scored fused shared experts, so it has to
+give AITER's outputs: the same expert ids (lowest id on ties), the same
+weights, sigmoid shared-expert weights, and -1 / 0 on rows at or past
+``num_valid_rows``.
+
+The CPU test runs the kernel under ``TRITON_INTERPRET=1`` in a subprocess (the
+interpreter is chosen when the module is imported) against a torch reference.
+The GPU tests compare it with AITER's kernel.
 """
+
+import inspect
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Triton router is GPU-only"
-)
-
+ATOM_ROOT = Path(__file__).resolve().parents[2]
 N_ROUTED, TOP_K = 512, 10
 
 
+def reference_route(
+    logits, n_routed, top_k, renormalize, num_shared, num_valid_rows=None
+):
+    """The routing contract in torch (also sent to the interpreter run)."""
+    import torch
+
+    x = logits[:, :n_routed].float()
+    x = torch.where(x.isnan(), torch.full_like(x, -float("inf")), x)
+    # stable descending sort: equal logits (incl. -0.0 / +0.0) keep id order
+    ids = torch.sort(x, dim=1, descending=True, stable=True).indices[:, :top_k]
+    vals = x.gather(1, ids)
+    row_max = vals[:, :1]
+    numer = torch.exp(vals - row_max)
+    if renormalize:
+        denom = numer.sum(dim=1, keepdim=True)
+    else:
+        denom = torch.exp(x - row_max).sum(dim=1, keepdim=True)
+    weights = numer / denom
+    ids = ids.to(torch.int32)
+    if num_valid_rows is not None:
+        pad = torch.arange(x.shape[0], device=x.device) >= int(num_valid_rows)
+        ids[pad] = -1
+        weights[pad] = 0.0
+    if num_shared:
+        shared = torch.sigmoid(logits[:, n_routed : n_routed + num_shared].float())
+        weights = torch.cat([weights, shared], dim=1)
+    return weights, ids
+
+
+# Inputs the selection has to rank exactly like the reference: random logits,
+# integer logits with many ties at the top-k boundary, signed zeros, -inf,
+# NaN, a strided [M, 513] view of a 528-wide buffer, and padding rows.
+_INTERPRET_CASES = textwrap.dedent("""
+    import itertools
+    import torch
+    from atom.model_ops.triton_topk_softmax import triton_topk_softmax
+
+    N, K = 512, 10
+
+    def logits_cases(dtype):
+        g = torch.Generator().manual_seed(0)
+        yield "randn", (torch.randn(6, N + 1, generator=g) * 3).to(dtype)
+        yield "ties", torch.randint(-3, 4, (6, N + 1), generator=g).to(dtype)
+        z = torch.full((2, N + 1), -1.0)
+        z[:, :9] = torch.arange(9, 0, -1).float()
+        z[0, 9], z[0, 10] = -0.0, 0.0
+        z[1, 9], z[1, 10] = 0.0, -0.0
+        yield "signed_zeros", z.to(dtype)
+        inf = torch.full((2, N + 1), -float("inf"))
+        inf[0, 5], inf[0, 300] = 1.0, 0.5  # 8 of the top-10 are -inf ties
+        inf[1, :] = torch.randn(N + 1, generator=g)
+        inf[1, ::3] = -float("inf")
+        yield "neg_inf", inf.to(dtype)
+        nan = torch.randn(2, N + 1, generator=g)
+        nan[:, 7] = float("nan")
+        yield "nan", nan.to(dtype)
+        wide = torch.randn(5, 528, generator=g).to(dtype)
+        yield "stride528", wide[:, : N + 1]
+
+    for dtype, renorm, shared, padded in itertools.product(
+        (torch.bfloat16, torch.float16, torch.float32), (True, False), (0, 1),
+        (False, True),
+    ):
+        for name, logits in logits_cases(dtype):
+            if not shared:
+                logits = logits[:, :N]
+            m = logits.shape[0]
+            valid = torch.tensor([m - 2], dtype=torch.int32) if padded else None
+            w = torch.full((m, K + 1), -7.0)
+            i = torch.full((m, K + 1), -7, dtype=torch.int32)
+            triton_topk_softmax(w, i, logits, K, renorm, shared, valid)
+            rw, ri = reference_route(logits, N, K, renorm, shared,
+                                     None if valid is None else valid.item())
+            tag = (name, dtype, renorm, shared, padded)
+            assert torch.equal(i[:, :K], ri), tag
+            torch.testing.assert_close(w[:, : K + shared], rw, atol=1e-6, rtol=1e-5,
+                                       equal_nan=True, msg=str(tag))
+            assert torch.all(i[:, K] == -7), tag  # shared ids are never written
+            if not shared:
+                assert torch.all(w[:, K] == -7.0), tag
+    print("ok")
+    """)
+
+
+def test_triton_router_matches_reference_in_interpreter():
+    pytest.importorskip("triton")
+    env = dict(os.environ, TRITON_INTERPRET="1", PYTHONPATH=str(ATOM_ROOT))
+    env.pop("CUDA_VISIBLE_DEVICES", None)
+    proc = subprocess.run(
+        [sys.executable, "-c", inspect.getsource(reference_route) + _INTERPRET_CASES],
+        cwd=ATOM_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-4000:]
+    assert proc.stdout.strip().endswith("ok")
+
+
+gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+
+
 @pytest.fixture
-def topk_mod():
+def topk_mod(monkeypatch):
+    """topK with its shared routing buffer set for 512 experts + 1 shared.
+
+    The buffer is a module global that ``init_aiter_topK_meta_data`` caches;
+    the uncached function fills it and monkeypatch puts the previous one back,
+    so later tests in the process see what they set up themselves.
+    """
+    pytest.importorskip("aiter")
     import atom.model_ops.topK as topK_mod
 
-    topK_mod.init_aiter_topK_meta_data.cache_clear()
-    topK_mod.init_aiter_topK_meta_data(
+    monkeypatch.setattr(topK_mod, "aiter_topK_meta_data", None)
+    topK_mod.init_aiter_topK_meta_data.__wrapped__(
         n_routed_experts=N_ROUTED,
         n_shared_experts=1,
         top_k=TOP_K,
         tp_rank=0,
         tp_size=1,
-        max_num_tokens=256,
+        max_num_tokens=1024,
         is_EP=False,
     )
-    yield topK_mod
-    topK_mod.init_aiter_topK_meta_data.cache_clear()
+    return topK_mod
 
 
-def _route(topk_mod, monkeypatch, logits, max_tokens):
-    monkeypatch.setattr(topk_mod, "_triton_topk_softmax_max_tokens", lambda: max_tokens)
-    return topk_mod.rocm_aiter_topk_softmax(
+def _aiter_route(logits, renormalize, num_shared, num_valid_rows=None):
+    from aiter import topk_softmax
+
+    m = logits.shape[0]
+    w = torch.empty(m, TOP_K + num_shared, dtype=torch.float32, device="cuda")
+    i = torch.empty(m, TOP_K, dtype=torch.int32, device="cuda")
+    topk_softmax(
+        w,
+        i,
+        torch.empty_like(i),
         logits,
-        TOP_K,
-        True,
-        num_fused_shared_experts=1,
-        num_routing_experts=N_ROUTED,
-        fused_shared_experts_scoring_func="sigmoid",
+        renormalize,
+        num_shared,
+        "sigmoid" if num_shared else "",
+        num_valid_rows,
     )
+    return w, i
 
 
-def _by_id(weights, ids):
-    order = ids[:, :TOP_K].argsort(dim=1)
-    return weights[:, :TOP_K].gather(1, order), ids[:, :TOP_K].gather(1, order)
+def _triton_route(logits, renormalize, num_shared, num_valid_rows=None):
+    from atom.model_ops.triton_topk_softmax import triton_topk_softmax_op
+
+    m = logits.shape[0]
+    w = torch.empty(m, TOP_K + num_shared, dtype=torch.float32, device="cuda")
+    i = torch.empty(m, TOP_K, dtype=torch.int32, device="cuda")
+    triton_topk_softmax_op(w, i, logits, TOP_K, renormalize, num_shared, num_valid_rows)
+    return w, i
 
 
-def _assert_same_routing(new, old, logits):
-    (w_new, i_new), (w_old, i_old) = new, old
-    w_new_s, i_new_s = _by_id(w_new, i_new)
-    w_old_s, i_old_s = _by_id(w_old, i_old)
-    assert torch.equal(i_new_s, i_old_s)
-    torch.testing.assert_close(w_new_s, w_old_s, atol=1e-6, rtol=1e-5)
-    assert torch.all(i_new[:, TOP_K] == N_ROUTED)
-    torch.testing.assert_close(
-        w_new[:, TOP_K], torch.sigmoid(logits[:, N_ROUTED].float()), atol=1e-6, rtol=0
-    )
+def _assert_same(new, old):
+    torch.testing.assert_close(new[1], old[1], atol=0, rtol=0)
+    torch.testing.assert_close(new[0], old[0], atol=1e-6, rtol=1e-5)
 
 
+@gpu
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("tokens", [1, 4, 36, 128])
-def test_triton_router_matches_aiter(topk_mod, monkeypatch, tokens, dtype):
-    torch.manual_seed(tokens)
-    logits = (torch.randn(tokens, N_ROUTED + 1, device="cuda") * 3).to(dtype)
-    assert topk_mod._use_triton_topk_softmax(logits, 1, "sigmoid")
-    w, i = _route(topk_mod, monkeypatch, logits, 128)
-    assert w.shape == i.shape == (tokens, TOP_K + 1)
-    assert w.is_contiguous() and i.is_contiguous()
-    new = (w.clone(), i.clone())
-    old = tuple(t.clone() for t in _route(topk_mod, monkeypatch, logits, 0))
-    _assert_same_routing(new, old, logits)
-    torch.testing.assert_close(
-        new[0][:, :TOP_K].sum(dim=1), torch.ones(tokens, device="cuda")
-    )
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_triton_router_ties_pick_lowest_expert_id(topk_mod, monkeypatch, dtype):
-    # Integer logits in [-3, 3]: dozens of exact ties at the top-k boundary.
-    torch.manual_seed(1)
-    logits = torch.randint(-3, 4, (16, N_ROUTED + 1), device="cuda").to(dtype)
-    new = tuple(t.clone() for t in _route(topk_mod, monkeypatch, logits, 128))
-    old = tuple(t.clone() for t in _route(topk_mod, monkeypatch, logits, 0))
-    assert torch.equal(new[1], old[1])  # same ids in the same order
-    _assert_same_routing(new, old, logits)
-
-
-def test_gate_keeps_aiter_outside_small_m_fused_sigmoid(topk_mod, monkeypatch):
-    monkeypatch.setattr(topk_mod, "_triton_topk_softmax_max_tokens", lambda: 128)
-    small = torch.empty(128, N_ROUTED + 1, device="cuda")
-    large = torch.empty(129, N_ROUTED + 1, device="cuda")
-    assert topk_mod._use_triton_topk_softmax(small, 1, "sigmoid")
-    assert not topk_mod._use_triton_topk_softmax(large, 1, "sigmoid")
-    assert not topk_mod._use_triton_topk_softmax(small, 1, "")
-    assert not topk_mod._use_triton_topk_softmax(small, 0, "sigmoid")
-    assert not topk_mod._use_triton_topk_softmax(small[:, :N_ROUTED].t(), 1, "sigmoid")
-
-
-@pytest.mark.parametrize("renormalize", [True, False])
 @pytest.mark.parametrize("num_shared", [0, 1])
-def test_triton_router_kernel_vs_torch(renormalize, num_shared):
-    from atom.model_ops.triton_topk_softmax import triton_topk_softmax
-
-    torch.manual_seed(0)
-    tokens = 9
-    logits = torch.randn(tokens, N_ROUTED + num_shared, device="cuda")
-    w = torch.full((tokens, TOP_K + 1), -1.0, device="cuda")
-    i = torch.full((tokens, TOP_K + 1), -1, dtype=torch.int32, device="cuda")
-    triton_topk_softmax(w, i, logits, TOP_K, renormalize, num_shared)
-
-    probs = logits[:, :N_ROUTED].softmax(dim=1)
-    ref_w, ref_i = probs.topk(TOP_K, dim=1)
-    if renormalize:
-        ref_w = ref_w / ref_w.sum(dim=1, keepdim=True)
-    assert torch.equal(i[:, :TOP_K].long(), ref_i)
-    torch.testing.assert_close(w[:, :TOP_K], ref_w, atol=1e-6, rtol=1e-5)
-    assert torch.all(i[:, TOP_K] == -1)  # shared ids are preset, never written
-    if num_shared:
-        torch.testing.assert_close(w[:, TOP_K], torch.sigmoid(logits[:, N_ROUTED]))
-    else:
-        assert torch.all(w[:, TOP_K] == -1.0)
+@pytest.mark.parametrize("tokens", [1, 4, 36, 128, 1000])
+def test_triton_router_matches_aiter(tokens, num_shared, dtype):
+    pytest.importorskip("aiter")
+    torch.manual_seed(tokens)
+    logits = (torch.randn(tokens, N_ROUTED + num_shared, device="cuda") * 3).to(dtype)
+    for renormalize in (True, False):
+        _assert_same(
+            _triton_route(logits, renormalize, num_shared),
+            _aiter_route(logits, renormalize, num_shared),
+        )
 
 
-def test_triton_router_cuda_graph_replay(topk_mod, monkeypatch):
+@gpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_triton_router_ties_and_padding_rows_match_aiter(dtype):
+    pytest.importorskip("aiter")
+    torch.manual_seed(1)
+    # Integer logits in [-3, 3]: dozens of exact ties at the top-k boundary.
+    logits = torch.randint(-3, 4, (16, N_ROUTED + 1), device="cuda").to(dtype)
+    valid = torch.tensor([11], dtype=torch.int32, device="cuda")
+    new = _triton_route(logits, True, 1, valid)
+    _assert_same(new, _aiter_route(logits, True, 1, valid))
+    assert torch.all(new[1][11:] == -1) and torch.all(new[0][11:, :TOP_K] == 0)
+    ref_w, ref_i = reference_route(logits.cpu(), N_ROUTED, TOP_K, True, 1, 11)
+    torch.testing.assert_close(new[1].cpu(), ref_i, atol=0, rtol=0)
+    torch.testing.assert_close(new[0].cpu(), ref_w, atol=1e-6, rtol=1e-5)
+
+
+@gpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("tokens", [4, 40])
+def test_fused_shared_topk_reads_padded_stride_logits(topk_mod, tokens, dtype):
+    """A [M, 513] view of a 528-wide router output routes like contiguous logits."""
+    padded = torch.randn(tokens, 528, device="cuda").to(dtype)
+    view = padded[:, : N_ROUTED + 1]
+
+    def route(logits):
+        w, ids = topk_mod.rocm_aiter_topk_softmax(
+            logits,
+            TOP_K,
+            True,
+            num_fused_shared_experts=1,
+            num_routing_experts=N_ROUTED,
+            fused_shared_experts_scoring_func="sigmoid",
+        )
+        return w.clone(), ids.clone()
+
+    w_view, ids_view = route(view)
+    w_ref, ids_ref = route(view.contiguous())
+    torch.testing.assert_close(ids_view, ids_ref, atol=0, rtol=0)
+    torch.testing.assert_close(w_view, w_ref, atol=0, rtol=0)
+    assert torch.all(ids_view[:, TOP_K] == N_ROUTED)  # preset shared id
+    _assert_same(
+        (w_view, ids_view[:, :TOP_K]), _aiter_route(view.contiguous(), True, 1)
+    )
+
+
+@gpu
+def test_triton_router_cuda_graph_replay(topk_mod):
     tokens = 8
     static = torch.randn(tokens, N_ROUTED + 1, device="cuda").to(torch.bfloat16)
-    _route(topk_mod, monkeypatch, static, 128)  # compile outside capture
-    torch.cuda.synchronize()
+    valid = torch.tensor([tokens], dtype=torch.int32, device="cuda")
 
+    def route():
+        return topk_mod.rocm_aiter_topk_softmax(
+            static,
+            TOP_K,
+            True,
+            num_fused_shared_experts=1,
+            num_routing_experts=N_ROUTED,
+            fused_shared_experts_scoring_func="sigmoid",
+            num_valid_rows=valid,
+        )
+
+    route()  # compile outside capture
+    torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        w_out, i_out = _route(topk_mod, monkeypatch, static, 128)
-    assert w_out.shape == i_out.shape == (tokens, TOP_K + 1)
+        w_out, i_out = route()
 
-    for seed in range(3):
-        torch.manual_seed(100 + seed)
-        fresh = (torch.randn(tokens, N_ROUTED + 1, device="cuda") * 3).to(
-            torch.bfloat16
-        )
-        static.copy_(fresh)
+    for seed, n_valid in ((100, tokens), (101, 5), (102, 1)):
+        torch.manual_seed(seed)
+        static.copy_(torch.randn_like(static, dtype=torch.float32).mul(3))
+        valid.fill_(n_valid)
         graph.replay()
         torch.cuda.synchronize()
-        new = (w_out.clone(), i_out.clone())
-        old = tuple(t.clone() for t in _route(topk_mod, monkeypatch, fresh, 0))
-        _assert_same_routing(new, old, fresh)
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_triton_router_signed_zeros_tie_on_lowest_id(dtype):
-    from atom.model_ops.triton_topk_softmax import triton_topk_softmax
-
-    # Nine positive logits, then -0.0 at expert 9 and +0.0 at expert 10: the
-    # tenth pick is a tie between equal logits and must be expert 9.
-    logits = torch.full((2, N_ROUTED), -1.0, device="cuda")
-    logits[:, :9] = torch.arange(9, 0, -1, device="cuda", dtype=torch.float32)
-    logits[:, 9] = -0.0
-    logits[:, 10] = 0.0
-    logits[1, 9], logits[1, 10] = 0.0, -0.0  # either sign order
-    logits = logits.to(dtype)
-    assert torch.signbit(logits[0, 9]) and not torch.signbit(logits[0, 10])
-    w = torch.zeros(2, TOP_K, device="cuda")
-    i = torch.zeros(2, TOP_K, dtype=torch.int32, device="cuda")
-    triton_topk_softmax(w, i, logits, TOP_K, True, 0)
-    expected = torch.arange(TOP_K, device="cuda", dtype=torch.int32)
-    assert torch.equal(i, expected.expand(2, TOP_K))
-    torch.testing.assert_close(w[0], w[1])
+        ref = _aiter_route(static, True, 1, valid)
+        _assert_same((w_out.clone(), i_out[:, :TOP_K].clone()), ref)
