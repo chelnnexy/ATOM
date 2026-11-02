@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 import weakref
 from typing import Any
@@ -38,6 +37,7 @@ from atom.kv_transfer.offload.mp.transfer import (
     _enforce_transfer_deadline,
     _transfer_deadline_s,
 )
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -138,7 +138,6 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     # tokens (`LMCacheMPConnector._resolve_shipped_tokens`); only tokens past
     # what they already hold travel. ATOM_MP_INCREMENTAL_TOKENS=0 ships whole
     # prefixes again.
-    _INCREMENTAL_TOKENS = os.environ.get("ATOM_MP_INCREMENTAL_TOKENS", "1") == "1"
 
     def _ship_tokens(self, seq: Any, end: int) -> tuple[int, list[int]]:
         """(worker-held prefix length, tokens to append) for prefix ``[0, end)``."""
@@ -167,7 +166,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     def _build_save_request(
         self, seq, saved, aligned, operation, block_ids, is_last_prefill
     ):
-        if not self._INCREMENTAL_TOKENS:
+        if not envs.ATOM_MP_INCREMENTAL_TOKENS:
             return super()._build_save_request(
                 seq, saved, aligned, operation, block_ids, is_last_prefill
             )
@@ -184,7 +183,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         )
 
     def _build_load_request(self, seq, load_spec, load_operation, transfer_end):
-        if not self._INCREMENTAL_TOKENS:
+        if not envs.ATOM_MP_INCREMENTAL_TOKENS:
             return super()._build_load_request(
                 seq, load_spec, load_operation, transfer_end
             )
@@ -373,6 +372,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             if callable(in_flight) and in_flight(sid):
                 continue
             del pending[sid]
+            # No save can follow now. A late save re-created the worker-held
+            # token prefix after `request_finished` dropped it; drop it again.
+            self._drop_shipped_tokens(seq.id)
             try:
                 self._mp_adapter.end_session(_mp_session_id(self._config, seq.id))
             except Exception:
