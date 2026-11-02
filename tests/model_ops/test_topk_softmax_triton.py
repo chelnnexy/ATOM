@@ -3,14 +3,16 @@
 """The Triton softmax top-k router (``atom/model_ops/triton_topk_softmax.py``).
 
 ``rocm_aiter_topk_softmax_impl`` runs it in place of AITER ``topk_softmax`` for
-softmax routing with no or sigmoid-scored fused shared experts, so it has to
-give AITER's outputs: the same expert ids (lowest id on ties), the same
-weights, sigmoid shared-expert weights, and -1 / 0 on rows at or past
-``num_valid_rows``.
+the Qwen3-Next / Qwen3.5 routing shape (512 routed experts + one sigmoid-scored
+fused shared expert, at most 128 tokens), so it has to give AITER's outputs:
+the same expert ids (lowest id on ties), the same weights, sigmoid
+shared-expert weights, and -1 / 0 on rows at or past ``num_valid_rows``.
 
-The CPU test runs the kernel under ``TRITON_INTERPRET=1`` in a subprocess (the
-interpreter is chosen when the module is imported) against a torch reference.
-The GPU tests compare it with AITER's kernel.
+The interpreter test runs the kernel under ``TRITON_INTERPRET=1`` in a
+subprocess (the interpreter is chosen when the module is imported) against a
+torch reference; it needs only ``triton`` and CPU torch, and the CI unit job
+runs it in its own step after installing ``triton``. The GPU tests compare the
+kernel with AITER's, including under ``torch.compile``.
 """
 
 import inspect
@@ -280,3 +282,38 @@ def test_triton_router_cuda_graph_replay(topk_mod):
         torch.cuda.synchronize()
         ref = _aiter_route(static, True, 1, valid)
         _assert_same((w_out.clone(), i_out[:, :TOP_K].clone()), ref)
+
+
+@gpu
+def test_fused_shared_topk_under_torch_compile(topk_mod):
+    """The op writes into a column view of the shared routing buffer
+    (``total_topk_ids[:, :top_k]``); compiled and eager routing must agree,
+    on both sides of the Triton / AITER token cutoff and with padding rows."""
+    valid = torch.tensor([0], dtype=torch.int32, device="cuda")
+
+    def route(logits):
+        w, ids = topk_mod.rocm_aiter_topk_softmax(
+            logits,
+            TOP_K,
+            True,
+            num_fused_shared_experts=1,
+            num_routing_experts=N_ROUTED,
+            fused_shared_experts_scoring_func="sigmoid",
+            num_valid_rows=valid,
+        )
+        return w.clone(), ids.clone()
+
+    torch._dynamo.reset()
+    compiled = torch.compile(route, fullgraph=True, dynamic=True)
+    for tokens in (1, 4, 40, 128, 200):
+        torch.manual_seed(tokens)
+        logits = (torch.randn(tokens, N_ROUTED + 1, device="cuda") * 3).to(
+            torch.bfloat16
+        )
+        valid.fill_(max(tokens - 3, 1))
+        w_eager, i_eager = route(logits)
+        w_comp, i_comp = compiled(logits)
+        torch.testing.assert_close(i_comp, i_eager, atol=0, rtol=0)
+        torch.testing.assert_close(w_comp, w_eager, atol=0, rtol=0)
+        assert torch.all(i_comp[:, TOP_K] == N_ROUTED)
+        _assert_same((w_comp, i_comp[:, :TOP_K]), _aiter_route(logits, True, 1, valid))

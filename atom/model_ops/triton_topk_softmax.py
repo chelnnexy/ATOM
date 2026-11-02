@@ -2,8 +2,10 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Softmax top-k router, optionally with sigmoid-scored fused shared experts.
 
-Drop-in for AITER ``topk_softmax`` (``vllm::moe::topkGatingSoftmax``): same
-outputs, one Triton program (one wave) per token row.
+Drop-in for AITER ``topk_softmax`` (``vllm::moe::topkGatingSoftmax``), one
+Triton program (one wave) per token row. Same expert ids and weights up to fp32
+rounding whenever at least K routed logits per row are finite; the differences
+are listed at the end.
 
 * routed weights: softmax over the first ``N`` logits, top-``K`` by logit
   (lowest expert id wins ties), renormalised over the K winners (or over the
@@ -18,8 +20,17 @@ outputs, one Triton program (one wave) per token row.
 Each selection round takes the row maximum, then the lowest still-unselected
 expert id holding it (the rule of ``_route_slot`` in
 ``atom/model_ops/qwen4_exp/ops/moe_decode.py``). Selected experts are tracked
-in a mask rather than overwritten with -inf, so a real -inf logit still ranks
-by id. NaN logits rank as -inf.
+in a mask rather than overwritten with -inf.
+
+Differences from AITER:
+
+* fewer than K finite routed logits in a row: AITER overwrites each pick with
+  -inf, so once only -inf remains its next picks are the lowest ids holding
+  -inf, which can repeat an expert it already picked. Here the remaining picks
+  are the lowest *unselected* ids holding -inf, so a row never repeats an id.
+  Their weights are 0 in both.
+* NaN logits rank as -inf here; AITER's comparisons skip a NaN except as the
+  first value a thread reads, so where a NaN ends up is not defined there.
 
 The row-per-wave layout follows SGLang's ``_router_triton_kernel``
 (sglang/kernels/ops/moe/moe_fused_gate.py, Apache-2.0, Copyright the SGLang

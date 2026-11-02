@@ -201,6 +201,11 @@ def reassign_gathered_shared_ids(layer, topk_ids: torch.Tensor) -> None:
     topk_ids[:, top_k:] = total_topk_ids[:rows, top_k:]
 
 
+# Scope of the Triton softmax top-k router (see rocm_aiter_topk_softmax_impl).
+_TRITON_TOPK_ROUTED_EXPERTS = 512
+_TRITON_TOPK_MAX_TOKENS = 128
+
+
 def rocm_aiter_topk_softmax_impl(
     gating_output: torch.Tensor,
     topk: int,
@@ -227,10 +232,16 @@ def rocm_aiter_topk_softmax_impl(
         fused_shared_experts_for_kernel = 0
     else:
         fused_shared_experts_for_kernel = num_fused_shared_experts
-    # The Triton router gives AITER topk_softmax's outputs (ids, weights,
-    # sigmoid-scored shared columns, -1 / 0 padding rows) and is faster at
-    # decode M over 512 experts. Any other scoring function stays on AITER.
-    if fused_shared_experts_scoring_func in ("", "sigmoid"):
+    # The Triton router is only enabled where it was timed against AITER:
+    # 512 routed experts plus one sigmoid-scored fused shared expert
+    # (Qwen3-Next / Qwen3.5), at most 128 tokens. Other shapes keep AITER
+    # until measured.
+    if (
+        fused_shared_experts_scoring_func == "sigmoid"
+        and fused_shared_experts_for_kernel == 1
+        and gating_output.shape[1] == _TRITON_TOPK_ROUTED_EXPERTS + 1
+        and token <= _TRITON_TOPK_MAX_TOKENS
+    ):
         from atom.model_ops.triton_topk_softmax import triton_topk_softmax_op
 
         triton_topk_softmax_op(
