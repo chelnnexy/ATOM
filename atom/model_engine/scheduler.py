@@ -1146,10 +1146,13 @@ class Scheduler:
                 seq, decision.start, decision.resume, decision.chunk
             )
             if decision.verdict is _Verdict.ADMIT:
-                # An offload resume already holds its blocks.
+                # An offload resume already holds its blocks, and admission
+                # moves on from it without committing the calibration arm.
                 self.block_manager.reserve(dry.reserved, seq, decision.hbm_probe)
-                dry.admitted.append((seq, decision.start))
-            self._commit_calibration_arm()
+                self._commit_calibration_arm()
+            # Either way it is in `running` after admission, where a later seq
+            # can wait on it as a producer (`_wait_for_inflight_prefix`).
+            dry.admitted.append((seq, decision.start))
             result.chunks.append((decision.start, chunk))
             result.prefillable = True
             pending += chunk

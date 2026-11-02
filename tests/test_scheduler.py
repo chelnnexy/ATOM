@@ -19,6 +19,7 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
 )
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
+from atom.model_engine import scheduler as scheduler_module
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import (
@@ -1638,6 +1639,70 @@ class TestLocalPrefillProbe:
         batch, _ = sched.schedule()
         assert probed == (True, batch.total_tokens_num_prefill)
         assert producer in sched.running and consumer not in sched.running
+
+    @staticmethod
+    def _offload_connector():
+        """An offload tier with nothing more to load for a new request."""
+        return SimpleNamespace(
+            is_offload=True,
+            is_producer=False,
+            build_connector_meta=lambda: None,
+            get_num_new_matched_tokens=lambda seq: (0, False),
+            update_state_after_alloc=lambda seq: None,
+        )
+
+    def test_an_offload_resume_is_a_producer_for_later_seqs(self):
+        # The resume goes to `running` in admission, so the consumer behind it
+        # waits for its prompt-end checkpoint; the probe must not count it.
+        sched = self._hybrid(
+            long_prefill_token_threshold=16, max_num_batched_tokens=160
+        )
+        sched.set_prefill_delayer(_LocalDelayer())
+        sched.kv_connector = self._offload_connector()
+        producer = stateful_seq(list(range(3, 203)))
+        bm = sched.block_manager
+        assert bm.can_allocate(producer) == 0
+        assert bm.allocate(producer, 0)
+        # As the connector leaves it: blocks held from before it parked, the
+        # load reported, back in `waiting`.
+        producer.num_cached_tokens = 16
+        producer.offload_loaded = True
+        sched.waiting.append(producer)
+        consumer = stateful_seq(list(range(3, 203)) + list(range(900, 908)))
+        sched.add(consumer)
+        sched.add(stateful_seq(list(range(5000, 5020))))
+        probed = sched._local_prefill_pending_work()
+        batch, _ = sched.schedule()
+        assert probed == (True, batch.total_tokens_num_prefill) == (True, 140)
+        assert producer in sched.running and consumer not in sched.running
+
+    def test_an_offload_resume_does_not_commit_the_calibration_arm(
+        self, monkeypatch, seq_factory
+    ):
+        # Admission moves on from a resume without committing the arm an
+        # earlier, requeued sizing drew, so the next first chunk takes the arm
+        # the last admitted request did not. Today chunk sizing draws an arm
+        # only with at most one prefill source in the window, which a resume
+        # and a seq behind it are not: the window is forced here.
+        monkeypatch.setattr(scheduler_module, "has_sole_prefill", lambda recent: True)
+        sched = self._sched(
+            max_num_batched_tokens=256, max_num_seqs=4, max_model_len=256
+        )
+        sched.kv_connector = self._offload_connector()
+        sched.enable_dynamic_chunking = True
+        sched._calibrating = True
+        sched.dynamic_chunking_min_chunk_size = 4
+        resumed = seq_factory(list(range(8)))
+        for token in range(100, 112):
+            resumed.append_token(token)
+        resumed.block_table = [90, 91, 92, 93, 94]
+        resumed.offload_loaded = True
+        resumed.num_cached_tokens = 12
+        sched.waiting.append(resumed)
+        sched.add(seq_factory(list(range(500, 700))))
+        sched._calibration_arm_drawn = True
+        probed, admitted = self._probe_and_admit(sched)
+        assert (probed, admitted) == (72, 72)  # 8 resumed rows + the small arm
 
     @pytest.mark.parametrize("seed", range(24))
     def test_random_traffic(self, seq_factory, seed):
